@@ -118,6 +118,7 @@ Json::Value@ GH_Api(const string&in method, const string&in url, const string&in
     if (body.Length > 0) req.Body = body;
     if (method == "GET") req.Method = Net::HttpMethod::Get;
     else if (method == "POST") req.Method = Net::HttpMethod::Post;
+    else if (method == "PUT") req.Method = Net::HttpMethod::Put;
     else if (method == "PATCH") req.Method = Net::HttpMethod::Patch;
     else { MG_Log("GitHub: unsupported method " + method); return null; }
     req.Headers["Authorization"] = "token " + S_GHToken;
