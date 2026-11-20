@@ -103,14 +103,14 @@ bool MG_BlockEquals(const MGBlock&in a, const MGBlock&in b) {
     if (a.direction != b.direction || a.variant != b.variant || a.subVariant != b.subVariant) return false;
     if (a.color != b.color || a.lmQual != b.lmQual) return false;
     if (a.hasFree != b.hasFree) return false;
-    if (a.hasFree && (a.freePos != b.freePos || a.freeRot != b.freeRot)) return false;
+    if (a.hasFree && (!(a.freePos == b.freePos) || !(a.freeRot == b.freeRot))) return false;
     if (a.hasSkin != b.hasSkin || a.hasWaypointProps != b.hasWaypointProps) return false;
     return true;
 }
 
 bool MG_ItemEquals(const MGItem&in a, const MGItem&in b) {
     if (a.key != b.key || a.itemModel != b.itemModel) return false;
-    if (a.position != b.position || a.rotation != b.rotation) return false;
+    if (!(a.position == b.position) || !(a.rotation == b.rotation)) return false;
     if (a.scale != b.scale || a.color != b.color || a.lmQual != b.lmQual) return false;
     if (a.hasWaypointProps != b.hasWaypointProps) return false;
     return true;
@@ -717,10 +717,9 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
                 spec.isGhost = e.isGhost;
             }
             spec.isGround = e.isGround;
-            spec.color = MG_ColorValue(e.color);
-            spec.lmQual = MG_LmValue(e.lmQual);
-            spec.mobilIx = e.variant;
-            spec.mobilVariant = e.subVariant;
+            spec.color = CGameCtnBlock::EMapElemColor(MG_ColorValue(e.color));
+            spec.lmQual = CGameCtnBlock::EMapElemLightmapQuality(MG_LmValue(e.lmQual));
+            spec.variant = e.variant; // BlockSpec's settable variant (mobilIx is read-only on the exported spec)
             if (e.hasWaypointProps) {
                 MG_Log("merge apply: WARNING - waypoint props on '" + e.name + "' are not re-applied (v1)");
             }
@@ -747,8 +746,8 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
             vec3 pyr = vec3(e.rotation.y, e.rotation.x, e.rotation.z);
             Editor::ItemSpec@ spec = Editor::MakeItemSpec(model, e.position, pyr);
             spec.scale = e.scale;
-            spec.color = MG_ColorValue(e.color);
-            spec.lmQual = MG_LmValue(e.lmQual);
+            spec.color = CGameCtnAnchoredObject::EMapElemColor(MG_ColorValue(e.color));
+            spec.lmQual = CGameCtnAnchoredObject::EMapElemLightmapQuality(MG_LmValue(e.lmQual));
             specs.InsertLast(spec);
         }
         if (specs.Length > 0 && !Editor::PlaceItems(specs, true)) {
@@ -1016,8 +1015,8 @@ void RenderMergeSection() {
             }
             for (uint i = 0; i < g_mgConflicts.Length; i++) {
                 MGMergeConflict@ c = g_mgConflicts[i];
-                UI::BulletText(MG_KindName(c.kind) + "  " + c.key +
-                               "   [ours: " + c.oursSummary + "  theirs: " + c.theirsSummary + "]");
+                UI::Text("  - " + MG_KindName(c.kind) + "  " + c.key +
+                         "   [ours: " + c.oursSummary + "  theirs: " + c.theirsSummary + "]");
                 UI::SameLine();
                 MG_ResolutionButton(c, 1, "Ours");
                 UI::SameLine();
