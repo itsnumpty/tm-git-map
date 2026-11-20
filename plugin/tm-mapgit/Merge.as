@@ -883,8 +883,10 @@ void MG_MergeWork() {
         return;
     }
     if (baseSha == oursTip) {
-        MG_Log("merge: '" + source + "' is ahead with no local changes — use Switch or Download instead (fast-forward)");
-        g_mgMergeStatus = "fast-forward — use Switch instead";
+        MG_Log("merge: '" + source + "' already contains everything on '" + oursBranch +
+               "' (it was created after your latest commit) — there is nothing to combine. " +
+               "Switch to '" + source + "' to get its changes (fast-forward).");
+        g_mgMergeStatus = "'" + source + "' is ahead - nothing to combine (Switch instead)";
         g_mgRepoBusy = false;
         return;
     }
