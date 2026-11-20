@@ -478,9 +478,14 @@ bool GH_DownloadBlob(const string&in gitBlobSha, const string&in expectedSha256,
 string GH_ImportRemoteCommit(const string&in msg, const string&in authorName, const string&in isoTime,
                              const string&in parentLocal) {
     if (!msg.StartsWith("mapgit:v1 manifest:")) return ""; // bootstrap/foreign commit — skip
-    string manifestSha = msg.SubStr(20, 64);
-    string blobSha = msg.SubStr(90, 64);
-    string origMsg = msg.SubStr(156, int(msg.Length) - 156 - 27);
+    // "mapgit:v1 manifest:" (19) + sha64 + " blob:" (6) + sha64 + "\n\n" + orig + " (MapGit commit xxxxxxxxxx)" (27)
+    if (msg.SubStr(83, 6) != " blob:") {
+        MG_Log("pull: unexpected commit header format; cannot parse");
+        return "";
+    }
+    string manifestSha = msg.SubStr(19, 64);
+    string blobSha = msg.SubStr(89, 64);
+    string origMsg = msg.SubStr(155, int(msg.Length) - 155 - 27);
     int64 time = GH_ParseIsoTime(isoTime);
 
     // objects: skip downloads if we already have them (shared history)
@@ -552,13 +557,13 @@ void GH_PullWork() {
     GH_ReadRemoteState(repoDir, branch, lastLocal, lastGit);
 
     // remote ref
-    Json::Value@ ref = GH_Api("GET", GH_ApiUrl("/git/refs/heads/" + branch), "");
-    if (ref is null && g_ghLastCode == 404) {
+    Json::Value@ remoteRef = GH_Api("GET", GH_ApiUrl("/git/refs/heads/" + branch), "");
+    if (remoteRef is null && g_ghLastCode == 404) {
         MG_Log("pull: remote branch '" + branch + "' does not exist — push first");
         g_ghBusy = false; g_ghStatus = "remote branch missing"; return;
     }
-    if (ref is null) { g_ghBusy = false; g_ghStatus = "ref read failed"; return; }
-    string remoteGit = ref["object"]["sha"];
+    if (remoteRef is null) { g_ghBusy = false; g_ghStatus = "ref read failed"; return; }
+    string remoteGit = remoteRef["object"]["sha"];
     if (remoteGit == lastGit) {
         MG_Log("pull: already up to date (" + branch + ")");
         g_ghStatus = "up to date";

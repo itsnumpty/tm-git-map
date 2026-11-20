@@ -26,6 +26,10 @@ string MG_ReadTextFile(const string&in path) {
     IO::File f(path, IO::FileMode::Read);
     string s = f.ReadToEnd();
     f.Close();
+    // trim trailing whitespace (external tools add CRLF; never let it into shas/urls)
+    while (s.EndsWith("\r") || s.EndsWith("\n") || s.EndsWith(" ") || s.EndsWith("\t")) {
+        s = s.SubStr(0, int(s.Length) - 1);
+    }
     return s;
 }
 
