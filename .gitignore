@@ -1,0 +1,11 @@
+# Build output
+bin/
+obj/
+*.user
+.vs/
+
+# Local-only fixture maps (user content, do not publish)
+fixtures/maps/
+
+# Local Openplanet dev install
+OpenplanetNext/

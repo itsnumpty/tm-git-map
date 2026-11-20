@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MapGit.Cli/MapGit.Cli.csproj" />
+    <Project Path="src/MapGit.Core.Tests/MapGit.Core.Tests.csproj" />
+    <Project Path="src/MapGit.Core/MapGit.Core.csproj" />
+    <Project Path="src/MapGit.Gbx/MapGit.Gbx.csproj" />
+    <Project Path="src/MapGit.Git/MapGit.Git.csproj" />
+    <Project Path="src/MapGit.Repo/MapGit.Repo.csproj" />
+    <Project Path="src/MapGit.Tray/MapGit.Tray.csproj" />
+  </Folder>
+</Solution>

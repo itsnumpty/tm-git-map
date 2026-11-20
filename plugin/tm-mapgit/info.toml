@@ -1,0 +1,9 @@
+[meta]
+name        = "MapGit"
+author      = "its_numpty"
+category    = "Map Editor"
+version     = "0.1.0"
+
+[script]
+dependencies = ["Editor"]
+timeout = 60000

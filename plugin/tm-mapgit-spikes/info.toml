@@ -1,0 +1,9 @@
+[meta]
+name        = "MapGit Spikes"
+author      = "its_numpty"
+category    = "Map Editor"
+version     = "0.2.1"
+
+[script]
+dependencies = ["Editor"]
+timeout = 20000
