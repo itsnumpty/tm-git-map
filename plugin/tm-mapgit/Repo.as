@@ -181,6 +181,7 @@ void MG_RefreshStatusCoro() {
     MG_EnsureRepo(repoDir, g_mgRepoId, mapFile, map.MapName);
     g_mgRepoBranch = MG_CurrentBranch(repoDir);
     g_mgRepoTip = MG_TipSha(repoDir, g_mgRepoBranch);
+    MG_LoadBranches(repoDir);
 
     yield();
     MGManifest@ m = MG_BuildManifest(map);
@@ -296,6 +297,136 @@ void MG_CommitCoro() {
     g_mgRepoBusy = false;
 }
 
+// ------------------------- branches + checkout -------------------------
+
+array<string> g_mgBranches;
+int g_mgSelBranch = 0;
+string g_mgNewBranch = "";
+
+void MG_LoadBranches(const string&in repoDir) {
+    g_mgBranches.RemoveRange(0, g_mgBranches.Length);
+    string[]@ files = IO::IndexFolder(repoDir + "/refs/heads", false);
+    if (files is null) return;
+    for (uint i = 0; i < files.Length; i++) {
+        string[] parts = files[i].Split("/");
+        string name = parts[parts.Length - 1];
+        if (name.Length > 0) g_mgBranches.InsertLast(name);
+    }
+}
+
+string MG_SanitizeBranchName(const string&in nameIn) {
+    return nameIn.Replace("\\", "-").Replace("/", "-").Replace(":", "-").Replace(" ", "-")
+                 .Replace("*", "-").Replace("?", "-").Replace("\"", "-").Replace("<", "-")
+                 .Replace(">", "-").Replace("|", "-");
+}
+
+// Create + switch (git checkout -b): the new ref points at the current tip.
+void MG_CreateBranchCoro() {
+    g_mgRepoBusy = true;
+    CGameCtnChallenge@ map = GetMap();
+    if (map is null) { MG_Log("branch: no map open"); g_mgRepoBusy = false; return; }
+    string name = MG_SanitizeBranchName(g_mgNewBranch);
+    if (name.Length == 0) { MG_Log("branch: enter a name first"); g_mgRepoBusy = false; return; }
+    string repoDir = MG_ReposRoot() + "/" + MG_RepoIdFor(MG_MapFileOf(map));
+    string tip = MG_TipSha(repoDir, MG_CurrentBranch(repoDir));
+    if (tip.Length == 0) { MG_Log("branch: no commits yet — commit first"); g_mgRepoBusy = false; return; }
+    if (IO::FileExists(repoDir + "/refs/heads/" + name)) {
+        MG_Log("branch: '" + name + "' already exists"); g_mgRepoBusy = false; return;
+    }
+    MG_WriteTextFile(repoDir + "/refs/heads/" + name, tip);
+    MG_WriteTextFile(repoDir + "/HEAD", "ref: refs/heads/" + name);
+    g_mgNewBranch = "";
+    g_mgRepoBranch = name;
+    MG_LoadBranches(repoDir);
+    MG_Log("branch: created + switched to '" + name + "' at " + MG_Short(tip));
+    g_mgRepoBusy = false;
+}
+
+// Real branch switching: refuse when dirty, restore the target blob to the map
+// file, then reopen the map in the editor (verified S9 mechanism).
+void MG_CheckoutCoro() {
+    g_mgRepoBusy = true;
+    CGameCtnChallenge@ map = GetMap();
+    if (map is null) { MG_Log("checkout: no map open"); g_mgRepoBusy = false; return; }
+    if (g_mgSelBranch < 0 || g_mgSelBranch >= int(g_mgBranches.Length)) {
+        MG_Log("checkout: pick a branch first"); g_mgRepoBusy = false; return;
+    }
+    string target = g_mgBranches[g_mgSelBranch];
+    string mapFile = MG_MapFileOf(map);
+    string repoDir = MG_ReposRoot() + "/" + MG_RepoIdFor(mapFile);
+    string curBranch = MG_CurrentBranch(repoDir);
+    if (target == curBranch) { MG_Log("checkout: already on '" + target + "'"); g_mgRepoBusy = false; return; }
+    string tip = MG_TipSha(repoDir, curBranch);
+    if (tip.Length == 0) { MG_Log("checkout: current branch has no commits — commit first"); g_mgRepoBusy = false; return; }
+
+    // 1) refuse when dirty (live manifest must match the current tip's manifest)
+    MG_Log("checkout: checking for uncommitted changes...");
+    MGManifest@ m = MG_BuildManifest(map);
+    string tmp = IO::FromStorageFolder("checkout-manifest.json");
+    MG_WriteManifest(m, tmp);
+    yield();
+    string msha = MG_Sha256File(tmp);
+    string parents, tm, tb, author, message;
+    int64 time;
+    if (!MG_ReadCommit(repoDir, tip, parents, tm, tb, author, message, time)) {
+        MG_Log("checkout: HEAD commit unreadable"); g_mgRepoBusy = false; return;
+    }
+    if (tm != msha) {
+        g_mgRepoStatusText = "checkout refused: uncommitted changes (commit or undo them first)";
+        MG_Log("checkout: refused — working map differs from HEAD " + MG_Short(tip));
+        g_mgRepoBusy = false;
+        return;
+    }
+
+    // 2) restore the target branch's blob to the map file
+    string tTip = MG_TipSha(repoDir, target);
+    string tParents, tManifest, tBlob, tAuthor, tMessage;
+    int64 tTime;
+    if (!MG_ReadCommit(repoDir, tTip, tParents, tManifest, tBlob, tAuthor, tMessage, tTime)) {
+        MG_Log("checkout: target branch HEAD unreadable"); g_mgRepoBusy = false; return;
+    }
+    string blobPath = repoDir + "/objects/blobs/" + tBlob + ".gbx";
+    if (!IO::FileExists(blobPath)) { MG_Log("checkout: blob missing: " + blobPath); g_mgRepoBusy = false; return; }
+    CSystemFidFile@ mapFid = map.MapInfo.Fid;
+    string mapPath = (mapFid !is null) ? mapFid.FullFileName : IO::FromUserGameFolder(mapFile);
+    try {
+        MG_CopyFile(blobPath, mapPath);
+    } catch {
+        MG_Log("checkout: failed to write the map file: " + getExceptionInfo());
+        g_mgRepoBusy = false;
+        return;
+    }
+    MG_WriteTextFile(repoDir + "/HEAD", "ref: refs/heads/" + target);
+    MG_Log("checkout: restored " + MG_Short(tBlob) + " to the map file; reopening editor...");
+
+    // 3) reopen the map (verified S9 pattern: BackToMainMenu + readiness + EditMap)
+    if (!Permissions::OpenAdvancedMapEditor()) {
+        MG_Log("checkout: no advanced-editor permission — reopen the map manually");
+        g_mgRepoBusy = false;
+        return;
+    }
+    auto app = cast<CGameManiaPlanet>(GetApp());
+    app.BackToMainMenu();
+    while (!app.ManiaTitleControlScriptAPI.IsReady) yield();
+    while (app.Switcher.ModuleStack.Length < 1 || cast<CTrackManiaMenus>(app.Switcher.ModuleStack[0]) is null) yield();
+    yield();
+    app.ManiaTitleControlScriptAPI.EditMap(mapFile, "", "");
+    MG_Log("checkout: EditMap called — waiting for the editor to reload...");
+
+    uint waited = 0;
+    while (GetMap() is null && waited < 3000) { yield(); waited++; }
+    if (GetMap() is null) {
+        MG_Log("checkout: editor did not reopen in time — refresh status manually");
+        g_mgRepoBusy = false;
+        return;
+    }
+    g_mgRepoBranch = target;
+    MG_LoadBranches(repoDir);
+    MG_Log("checkout: now on '" + target + "' at " + MG_Short(tTip));
+    g_mgRepoBusy = false;
+    MG_RefreshStatusCoro();
+}
+
 // ------------------------- UI -------------------------
 
 void RenderRepoTab() {
@@ -321,6 +452,24 @@ void RenderRepoTab() {
     if (UI::Button("Refresh status")) startnew(MG_RefreshStatusCoro);
     UI::SameLine();
     if (UI::Button("Test SHA-256")) MG_Sha256SelfTest();
+    UI::EndDisabled();
+
+    UI::Separator();
+    UI::Text("Branches:");
+    if (g_mgBranches.Length == 0) {
+        UI::TextDisabled("  (refresh status to load)");
+    } else {
+        g_mgSelBranch = UI::Combo("##mg-branch", g_mgBranches, g_mgSelBranch);
+        UI::BeginDisabled(g_mgRepoBusy);
+        UI::SameLine();
+        if (UI::Button("Checkout")) startnew(MG_CheckoutCoro);
+        UI::EndDisabled();
+    }
+    UI::SetNextItemWidth(220);
+    g_mgNewBranch = UI::InputText("##mg-new-branch", g_mgNewBranch, changed);
+    UI::BeginDisabled(g_mgRepoBusy);
+    UI::SameLine();
+    if (UI::Button("Create branch")) startnew(MG_CreateBranchCoro);
     UI::EndDisabled();
 
     UI::Separator();
