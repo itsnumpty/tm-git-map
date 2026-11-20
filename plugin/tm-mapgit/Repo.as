@@ -278,9 +278,15 @@ void MG_CommitCoro() {
     yield();
     MG_CopyFile(mapPath, repoDir + "/objects/blobs/" + bsha + ".gbx");
 
-    // 6) commit object (sha = sha256 of the canonical commit json itself)
+    // 6) commit object (sha = sha256 of the canonical commit json itself).
+    // A merge adds a second parent (set by the merge flow).
+    string parentsCsv = tip;
+    if (g_mgMergeSecondParent.Length > 0) {
+        parentsCsv = (tip.Length > 0 ? tip + "," : "") + g_mgMergeSecondParent;
+        g_mgMergeSecondParent = "";
+    }
     string msg = g_mgCommitMsg.Length > 0 ? g_mgCommitMsg : "work in progress";
-    string commitJson = "{\"parents\":\"" + tip + "\",\"manifest\":\"" + msha + "\",\"blob\":\"" + bsha +
+    string commitJson = "{\"parents\":\"" + parentsCsv + "\",\"manifest\":\"" + msha + "\",\"blob\":\"" + bsha +
         "\",\"author\":\"" + S_MGAuthor + "\",\"message\":" + MG_JsonStr(msg) +
         ",\"time\":" + Time::Stamp +
         ",\"header\":\"mapgit:v1 manifest:" + msha + " blob:" + bsha + "\"}";
@@ -488,6 +494,8 @@ void RenderRepoTab() {
     UI::SameLine();
     if (UI::Button(T("New version line", "Create branch"))) startnew(MG_CreateBranchCoro);
     UI::EndDisabled();
+
+    RenderMergeSection();
 
     UI::Separator();
     UI::Text(T("Version history", "History") + ":");
