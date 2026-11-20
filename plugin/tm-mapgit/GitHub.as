@@ -9,14 +9,26 @@
 // Remote binding:   <repoDir>/remote.json  {owner, repo}
 // Remote state:     <repoDir>/refs/remotes/origin/<branch>  "<localSha> <gitSha>"
 
-[Setting name="GitHub OAuth Client ID"]
+// Production client id (the "Trackmania MapGit" OAuth app). Not a secret — OAuth
+// client ids are public identifiers; only the user's own token grants access.
+const string MG_GH_DEFAULT_CLIENT_ID = "Ov23likjqw7qR9j0rIH6";
+
+[Setting name="GitHub OAuth client id override (empty = built-in)"]
 string S_GHClientId = "";
 
+// Legacy setting, kept only to migrate tokens out of the SHARED Settings.ini
+// (where any plugin could read it by declaring the same setting name).
 [Setting name="GitHub token (device flow)" hidden]
 string S_GHToken = "";
 
+// The token lives in PluginStorage/tm-mapgit/auth.json (this plugin's own folder).
+// NOTE: Openplanet has no secret storage — the file is plaintext and any plugin can
+// read arbitrary files; this only removes the trivial settings-name exfiltration.
+// Revocation: github.com/settings/applications (one click), or Log out below.
+string g_ghToken = "";
 string g_ghUserCode = "";
 string g_ghUri = "";
+string g_ghUriComplete = "";
 string g_ghLogin = "";
 string g_ghStatus = "not connected";
 bool g_ghBusy = false;
@@ -25,11 +37,44 @@ bool g_ghPrivate = true;
 string g_ghExistingRepo = ""; // "owner/name" to bind without creating
 int g_ghLastCode = 0;
 
+string GH_ClientId() {
+    return (S_GHClientId.Length > 0) ? S_GHClientId : MG_GH_DEFAULT_CLIENT_ID;
+}
+
+string GH_TokenPath() {
+    return IO::FromStorageFolder("auth.json");
+}
+
+void GH_SaveToken() {
+    MG_WriteTextFile(GH_TokenPath(), "{\"token\":\"" + g_ghToken + "\",\"login\":\"" + g_ghLogin + "\"}");
+}
+
+void GH_LoadToken() {
+    string text = MG_ReadTextFile(GH_TokenPath());
+    if (text.Length > 0) {
+        try {
+            Json::Value@ j = Json::Parse(text);
+            if (j !is null) {
+                g_ghToken = j["token"];
+                if (j.HasKey("login") && g_ghLogin.Length == 0) g_ghLogin = j["login"];
+                return;
+            }
+        } catch { }
+    }
+    // one-time migration from the shared settings file
+    if (S_GHToken.Length > 0) {
+        g_ghToken = S_GHToken;
+        S_GHToken = "";
+        GH_SaveToken();
+        MG_Log("GitHub: token migrated from Settings.ini to plugin storage");
+    }
+}
+
 // ------------------------- device flow (S12-verified pattern) -------------------------
 
 void GH_StartDeviceFlow() {
-    if (S_GHClientId.Length == 0) {
-        MG_Log("GitHub: set the OAuth client id first");
+    if (GH_ClientId().Length == 0) {
+        MG_Log("GitHub: no client id available");
         return;
     }
     startnew(GH_DeviceFlowCoro);
@@ -39,7 +84,7 @@ void GH_DeviceFlowCoro() {
     g_ghBusy = true;
     auto req = Net::HttpRequest(
         "https://github.com/login/device/code",
-        "client_id=" + S_GHClientId + "&scope=repo");
+        "client_id=" + GH_ClientId() + "&scope=repo");
     req.Headers["Accept"] = "application/json";
     req.Start();
     while (!req.Finished()) yield();
@@ -61,6 +106,10 @@ void GH_DeviceFlowCoro() {
     string deviceCode = j["device_code"];
     g_ghUserCode = j["user_code"];
     g_ghUri = j["verification_uri"];
+    g_ghUriComplete = "";
+    if (j.HasKey("verification_uri_complete")) {
+        g_ghUriComplete = j["verification_uri_complete"]; // link with the code pre-filled
+    }
     int interval = j.HasKey("interval") ? int(j["interval"]) : 5;
     int expires = j.HasKey("expires_in") ? int(j["expires_in"]) : 900;
 
@@ -75,7 +124,7 @@ void GH_DeviceFlowCoro() {
 
         auto tokReq = Net::HttpRequest(
             "https://github.com/login/oauth/access_token",
-            "client_id=" + S_GHClientId +
+            "client_id=" + GH_ClientId() +
             "&device_code=" + deviceCode +
             "&grant_type=urn:ietf:params:oauth:grant-type:device_code");
         tokReq.Headers["Accept"] = "application/json";
@@ -84,9 +133,10 @@ void GH_DeviceFlowCoro() {
 
         Json::Value@ tj = tokReq.Json();
         if (tj !is null && tj.HasKey("access_token")) {
-            S_GHToken = tj["access_token"];
+            g_ghToken = tj["access_token"];
             g_ghUserCode = "";
-            MG_Log("GitHub: token acquired (" + S_GHToken.Length + " chars, stored in hidden setting)");
+            GH_SaveToken();
+            MG_Log("GitHub: token acquired (" + g_ghToken.Length + " chars, stored in plugin storage)");
             UI::ShowNotification("MapGit", "GitHub linked!");
             g_ghBusy = false;
             return;
@@ -109,7 +159,7 @@ void GH_DeviceFlowCoro() {
 // Performs a GET/POST/PATCH with auth; returns parsed Json (null on failure).
 // Sets g_ghLastCode for callers that expect e.g. 404.
 Json::Value@ GH_Api(const string&in method, const string&in url, const string&in body) {
-    if (S_GHToken.Length == 0) {
+    if (g_ghToken.Length == 0) {
         MG_Log("GitHub: no token — log in first");
         return null;
     }
@@ -121,7 +171,7 @@ Json::Value@ GH_Api(const string&in method, const string&in url, const string&in
     else if (method == "PUT") req.Method = Net::HttpMethod::Put;
     else if (method == "PATCH") req.Method = Net::HttpMethod::Patch;
     else { MG_Log("GitHub: unsupported method " + method); return null; }
-    req.Headers["Authorization"] = "token " + S_GHToken;
+    req.Headers["Authorization"] = "token " + g_ghToken;
     req.Headers["Accept"] = "application/vnd.github+json";
     if (body.Length > 0) req.Headers["Content-Type"] = "application/json";
     req.Start();
@@ -213,7 +263,7 @@ void GH_PushWork() {
     g_ghStatus = "pushing...";
     CGameCtnChallenge@ map = GetMap();
     if (map is null) { MG_Log("push: no map open"); g_ghBusy = false; g_ghStatus = "no map"; return; }
-    if (S_GHToken.Length == 0) { MG_Log("push: log in first"); g_ghBusy = false; g_ghStatus = "not logged in"; return; }
+    if (g_ghToken.Length == 0) { MG_Log("push: log in first"); g_ghBusy = false; g_ghStatus = "not logged in"; return; }
 
     // login (cached)
     if (g_ghLogin.Length == 0) {
@@ -235,7 +285,7 @@ void GH_PushWork() {
             GH_WriteRemote(repoDir);
             MG_Log("push: bound to existing " + g_ghOwner + "/" + g_ghRepo);
         } else {
-            if (S_GHClientId.SubStr(0, 2) == "Iv") {
+            if (GH_ClientId().SubStr(0, 2) == "Iv") {
                 MG_Log("push: client id is a GitHub App (Iv...) — its tokens cannot create repositories; "
                        "use a classic OAuth App or the existing-repository option");
             }
@@ -539,7 +589,7 @@ void GH_PullWork() {
     g_ghStatus = "pulling...";
     CGameCtnChallenge@ map = GetMap();
     if (map is null) { MG_Log("pull: no map open"); g_ghBusy = false; g_ghStatus = "no map"; return; }
-    if (S_GHToken.Length == 0) { MG_Log("pull: log in first"); g_ghBusy = false; g_ghStatus = "not logged in"; return; }
+    if (g_ghToken.Length == 0) { MG_Log("pull: log in first"); g_ghBusy = false; g_ghStatus = "not logged in"; return; }
     if (g_ghLogin.Length == 0) {
         Json::Value@ me = GH_Api("GET", "https://api.github.com/user", "");
         if (me is null) { g_ghBusy = false; g_ghStatus = "auth failed"; return; }
@@ -681,26 +731,34 @@ void RenderGitHubTab() {
     UI::Separator();
 
     bool changed;
-    UI::SetNextItemWidth(340);
+    UI::SetNextItemWidth(300);
     S_GHClientId = UI::InputText("##gh-client", S_GHClientId, changed);
     UI::SameLine();
-    UI::Text("client id");
+    UI::TextDisabled("client id override (empty = built-in)");
 
-    if (S_GHToken.Length == 0) {
-        UI::BeginDisabled(g_ghBusy || S_GHClientId.Length == 0);
+    if (g_ghToken.Length == 0) {
+        UI::BeginDisabled(g_ghBusy);
         if (UI::Button("Log in with GitHub")) GH_StartDeviceFlow();
         UI::EndDisabled();
         if (g_ghUserCode.Length > 0) {
-            UI::Text("\\$fe1 code: " + g_ghUserCode + "  at  " + g_ghUri + " (copied to clipboard)");
+            UI::Text("\\$fe1 code: " + g_ghUserCode + "  (copied to clipboard)");
+            string linkUrl = (g_ghUriComplete.Length > 0) ? g_ghUriComplete : g_ghUri;
+            if (g_ghUriComplete.Length > 0) {
+                UI::TextLinkOpenURL("\\$0f0\\$iOpen github.com/login/device (code pre-filled)", linkUrl);
+            } else {
+                UI::TextLinkOpenURL("\\$0f0\\$iOpen " + g_ghUri, linkUrl);
+            }
         }
     } else {
-        UI::Text("logged in as " + (g_ghLogin.Length > 0 ? g_ghLogin : "(unknown — will verify on push)"));
+        UI::Text("logged in as " + (g_ghLogin.Length > 0 ? g_ghLogin : "(unknown — will verify on upload)"));
         UI::SameLine();
         if (UI::Button("Log out")) {
-            S_GHToken = "";
+            g_ghToken = "";
             g_ghLogin = "";
+            S_GHToken = ""; // clears any legacy value too
+            GH_SaveToken();
             g_ghStatus = "not connected";
-            MG_Log("GitHub: token cleared — you can log in again (e.g. after changing the client id)");
+            MG_Log("GitHub: token cleared — you can log in again");
         }
     }
 
@@ -714,14 +772,14 @@ void RenderGitHubTab() {
     string repoDir = MG_ReposRoot() + "/" + MG_RepoIdFor(MG_MapFileOf(map));
     bool bound = GH_ReadRemote(repoDir);
     if (bound) {
-        UI::Text("Remote: " + g_ghOwner + "/" + g_ghRepo + "  (branch " + MG_CurrentBranch(repoDir) + ")");
-        UI::BeginDisabled(g_ghBusy || S_GHToken.Length == 0);
-        if (UI::Button("Push current branch")) GH_PushCoro();
+        UI::Text("Remote: " + g_ghOwner + "/" + g_ghRepo + "  (" + T("version line", "branch") + " " + MG_CurrentBranch(repoDir) + ")");
+        UI::BeginDisabled(g_ghBusy || g_ghToken.Length == 0);
+        if (UI::Button(T("Upload", "Push") + " " + T("current version line", "branch"))) GH_PushCoro();
         UI::SameLine();
-        if (UI::Button("Pull current branch")) GH_PullCoro();
+        if (UI::Button(T("Download", "Pull") + " " + T("current version line", "branch"))) GH_PullCoro();
         UI::EndDisabled();
     } else {
-        UI::Text("First push — creates a repository for this map:");
+        UI::Text("First upload — creates a repository for this map:");
         if (g_ghRepoName.Length == 0) {
             g_ghRepoName = GH_SanitizeRepoName(map.MapName);
         }
@@ -729,16 +787,16 @@ void RenderGitHubTab() {
         g_ghRepoName = UI::InputText("##gh-repo-name", g_ghRepoName, changed);
         UI::SameLine();
         g_ghPrivate = UI::Checkbox("Private", g_ghPrivate);
-        UI::BeginDisabled(g_ghBusy || S_GHToken.Length == 0 || g_ghRepoName.Length == 0);
-        if (UI::Button("Create repository & push")) GH_PushCoro();
+        UI::BeginDisabled(g_ghBusy || g_ghToken.Length == 0 || g_ghRepoName.Length == 0);
+        if (UI::Button(T("Create repository & upload", "Create repository & push"))) GH_PushCoro();
         UI::EndDisabled();
 
-        UI::Text("or push to an existing repository (GitHub App tokens cannot create repos):");
+        UI::Text("or upload to an existing repository (GitHub App tokens cannot create repos):");
         UI::SetNextItemWidth(280);
         g_ghExistingRepo = UI::InputText("##gh-existing", g_ghExistingRepo, changed);
         UI::SameLine();
-        UI::BeginDisabled(g_ghBusy || S_GHToken.Length == 0);
-        if (UI::Button("Bind & push")) startnew(GH_BindExistingCoro);
+        UI::BeginDisabled(g_ghBusy || g_ghToken.Length == 0);
+        if (UI::Button(T("Bind & upload", "Bind & push"))) startnew(GH_BindExistingCoro);
         UI::EndDisabled();
     }
 

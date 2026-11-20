@@ -456,7 +456,7 @@ void RenderRepoTab() {
     UI::SetNextItemWidth(440);
     g_mgCommitMsg = UI::InputText("##commit-msg", g_mgCommitMsg, changed);
     UI::BeginDisabled(g_mgRepoBusy);
-    if (UI::Button("Commit current map")) startnew(MG_CommitCoro);
+    if (UI::Button(T("Save version", "Commit current map"))) startnew(MG_CommitCoro);
     UI::SameLine();
     if (UI::Button("Refresh status")) startnew(MG_RefreshStatusCoro);
     UI::SameLine();
@@ -464,7 +464,7 @@ void RenderRepoTab() {
     UI::EndDisabled();
 
     UI::Separator();
-    UI::Text("Branches:");
+    UI::Text(T("Version lines", "Branches") + ":");
     if (g_mgBranches.Length == 0) {
         UI::TextDisabled("  (refresh status to load)");
     } else {
@@ -479,18 +479,18 @@ void RenderRepoTab() {
         }
         UI::BeginDisabled(g_mgRepoBusy);
         UI::SameLine();
-        if (UI::Button("Checkout")) startnew(MG_CheckoutCoro);
+        if (UI::Button(T("Switch", "Checkout"))) startnew(MG_CheckoutCoro);
         UI::EndDisabled();
     }
     UI::SetNextItemWidth(220);
     g_mgNewBranch = UI::InputText("##mg-new-branch", g_mgNewBranch, changed);
     UI::BeginDisabled(g_mgRepoBusy);
     UI::SameLine();
-    if (UI::Button("Create branch")) startnew(MG_CreateBranchCoro);
+    if (UI::Button(T("New version line", "Create branch"))) startnew(MG_CreateBranchCoro);
     UI::EndDisabled();
 
     UI::Separator();
-    UI::Text("History:");
+    UI::Text(T("Version history", "History") + ":");
     if (g_mgRepoLogLines.Length == 0) {
         UI::TextDisabled("  (no commits yet)");
     } else {

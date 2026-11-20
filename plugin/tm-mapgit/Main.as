@@ -1,10 +1,19 @@
 // tm-mapgit — git-style version control for Trackmania maps (Phase B).
 // Architecture: plugin-only runtime; the C# solution is the conformance harness.
 
+[Setting name="Developer terminology (git terms)"]
+bool S_DevTerms = false;
+
 bool g_windowVisible = true;
 
+// UI label helper: friendly term by default, git term when developer mode is on.
+string T(const string&in friendly, const string&in gitTerm) {
+    return S_DevTerms ? gitTerm : friendly;
+}
+
 void Main() {
-    print("MapGit v0.1.0 loaded (Phase B: ManifestBuilder v1). Open the MapGit window from the menu bar.");
+    GH_LoadToken();
+    print("MapGit v0.1.0 loaded. Open the MapGit window from the menu bar.");
 }
 
 void RenderMenu() {
@@ -26,7 +35,7 @@ void Render() {
         RenderManifestTab();
         UI::EndTabItem();
     }
-    if (UI::BeginTabItem("Repository")) {
+    if (UI::BeginTabItem(T("Versions", "Repository"))) {
         RenderRepoTab();
         UI::EndTabItem();
     }
