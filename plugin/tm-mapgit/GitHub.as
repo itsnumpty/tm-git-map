@@ -306,6 +306,11 @@ void GH_PushWork() {
 
         // git blob: the map snapshot
         string gitBlobSha = GH_UploadFileBlob(repoDir + "/objects/blobs/" + blob + ".gbx");
+        if (gitBlobSha.Length == 0 && g_ghLastCode == 409) {
+            MG_Log("push: empty repository — bootstrapping the initial commit via the Contents API...");
+            if (!GH_BootstrapRepo()) { g_ghBusy = false; g_ghStatus = "bootstrap failed"; return; }
+            gitBlobSha = GH_UploadFileBlob(repoDir + "/objects/blobs/" + blob + ".gbx");
+        }
         if (gitBlobSha.Length == 0) { g_ghBusy = false; g_ghStatus = "blob upload failed"; return; }
         yield();
 
@@ -355,6 +360,20 @@ void GH_PushWork() {
     g_ghStatus = "pushed " + branch + " (" + chain.Length + " commits) to " + g_ghOwner + "/" + g_ghRepo;
     MG_Log("push: done — " + g_ghStatus);
     g_ghBusy = false;
+}
+
+// Bootstraps a fresh repo: PUT /contents works on empty repositories and creates
+// the default branch, after which the git database API (blobs/trees/commits) works.
+bool GH_BootstrapRepo() {
+    string readme = "MapGit repository for this map - managed by the MapGit Openplanet plugin.\n\n"
+                    "Each commit contains map.Map.Gbx (snapshot) + manifest.json (canonical manifest).\n";
+    MemoryBuffer@ b = MemoryBuffer(readme.Length);
+    b.Write(readme);
+    b.Seek(0);
+    string b64 = b.ReadToBase64(b.GetSize());
+    string body = "{\"message\":\"MapGit init\",\"content\":\"" + b64 + "\"}";
+    Json::Value@ res = GH_Api("PUT", GH_ApiUrl("/contents/README.md"), body);
+    return res !is null;
 }
 
 // Uploads one file as a base64 git blob; returns the git blob sha ("" on failure).
@@ -423,6 +442,13 @@ void RenderGitHubTab() {
         }
     } else {
         UI::Text("logged in as " + (g_ghLogin.Length > 0 ? g_ghLogin : "(unknown — will verify on push)"));
+        UI::SameLine();
+        if (UI::Button("Log out")) {
+            S_GHToken = "";
+            g_ghLogin = "";
+            g_ghStatus = "not connected";
+            MG_Log("GitHub: token cleared — you can log in again (e.g. after changing the client id)");
+        }
     }
 
     UI::Separator();
