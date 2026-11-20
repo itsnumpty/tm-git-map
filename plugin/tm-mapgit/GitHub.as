@@ -422,6 +422,253 @@ void GH_BindExistingCoro() {
     GH_PushWork();
 }
 
+// ------------------------- pull -------------------------
+
+// Days-from-civil (Howard Hinnant) for ISO "2026-11-20T14:50:49Z" -> unix seconds.
+int64 GH_ParseIsoTime(const string&in iso) {
+    try {
+        string[] a = iso.Split("T");
+        string[] d = a[0].Split("-");
+        string[] t = a[1].Split(":");
+        string sec = t[2];
+        sec = sec.Replace("Z", "");
+        int y = Text::ParseInt(d[0]);
+        int mo = Text::ParseInt(d[1]);
+        int da = Text::ParseInt(d[2]);
+        int h = Text::ParseInt(t[0]);
+        int mi = Text::ParseInt(t[1]);
+        int s = Text::ParseInt(sec);
+        int64 yy = int64(y) - ((mo <= 2) ? 1 : 0);
+        int64 era = (yy >= 0 ? yy : yy - 399) / 400;
+        int64 yoe = yy - era * 400;
+        int64 doy = (153 * int64(mo + ((mo > 2) ? -3 : 9)) + 2) / 5 + int64(da) - 1;
+        int64 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        int64 days = era * 146097 + doe - 719468;
+        return days * 86400 + int64(h) * 3600 + int64(mi) * 60 + int64(s);
+    } catch {
+        return Time::Stamp;
+    }
+}
+
+// Downloads a git blob, verifies its sha256 against the expected content hash,
+// and writes it to the given local object path. Returns false on mismatch/failure.
+bool GH_DownloadBlob(const string&in gitBlobSha, const string&in expectedSha256, const string&in destPath) {
+    Json::Value@ b = GH_Api("GET", GH_ApiUrl("/git/blobs/" + gitBlobSha), "");
+    if (b is null) return false;
+    string content = b["content"];
+    content = content.Replace("\n", ""); // contents-style wrapping, just in case
+    MemoryBuffer@ buf = MemoryBuffer();
+    buf.WriteFromBase64(content);
+    buf.Seek(0);
+    string bytes = buf.ReadString(buf.GetSize());
+    string sha = Crypto::Sha256(bytes);
+    if (sha != expectedSha256) {
+        MG_Log("pull: VERIFICATION FAILED for " + destPath + " (got " + sha + ", want " + expectedSha256 + ")");
+        return false;
+    }
+    buf.Seek(0);
+    IO::File f(destPath, IO::FileMode::Write);
+    f.Write(buf);
+    f.Close();
+    return true;
+}
+
+// Imports one remote commit into the local store. Returns the new local sha ("" to skip).
+// Message format (fixed slices): "mapgit:v1 manifest:<64> blob:<64>\n\n<orig> (MapGit commit <10>)"
+string GH_ImportRemoteCommit(const string&in msg, const string&in authorName, const string&in isoTime,
+                             const string&in parentLocal) {
+    if (!msg.StartsWith("mapgit:v1 manifest:")) return ""; // bootstrap/foreign commit — skip
+    string manifestSha = msg.SubStr(20, 64);
+    string blobSha = msg.SubStr(90, 64);
+    string origMsg = msg.SubStr(156, int(msg.Length) - 156 - 27);
+    int64 time = GH_ParseIsoTime(isoTime);
+
+    // objects: skip downloads if we already have them (shared history)
+    string repoDir = MG_ReposRoot() + "/" + MG_RepoIdFor(MG_MapFileOf(GetMap()));
+    if (!IO::FileExists(repoDir + "/objects/blobs/" + blobSha + ".gbx") ||
+        !IO::FileExists(repoDir + "/objects/manifests/" + manifestSha + ".json")) {
+        // find the file blobs in the commit's tree
+        Json::Value@ c = GH_Api("GET", GH_ApiUrl("/git/commits/" + g_ghCurImportSha), "");
+        if (c is null) return "";
+        string treeSha = c["tree"]["sha"];
+        Json::Value@ tree = GH_Api("GET", GH_ApiUrl("/git/trees/" + treeSha), "");
+        if (tree is null) return "";
+        string gitMapSha = "", gitManSha = "";
+        Json::Value@ entries = tree["tree"];
+        for (uint i = 0; i < entries.Length; i++) {
+            string path = entries[i]["path"];
+            if (path == "map.Map.Gbx") gitMapSha = entries[i]["sha"];
+            if (path == "manifest.json") gitManSha = entries[i]["sha"];
+        }
+        if (gitMapSha.Length == 0 || gitManSha.Length == 0) {
+            MG_Log("pull: commit tree missing MapGit files; skipping");
+            return "";
+        }
+        if (!IO::FileExists(repoDir + "/objects/blobs/" + blobSha + ".gbx")) {
+            if (!GH_DownloadBlob(gitMapSha, blobSha, repoDir + "/objects/blobs/" + blobSha + ".gbx")) return "";
+        }
+        if (!IO::FileExists(repoDir + "/objects/manifests/" + manifestSha + ".json")) {
+            if (!GH_DownloadBlob(gitManSha, manifestSha, repoDir + "/objects/manifests/" + manifestSha + ".json")) return "";
+        }
+    }
+
+    // local commit object (same canonical shape as local commits)
+    string commitJson = "{\"parents\":\"" + parentLocal + "\",\"manifest\":\"" + manifestSha +
+        "\",\"blob\":\"" + blobSha + "\",\"author\":\"" + authorName + "\",\"message\":" + MG_JsonStr(origMsg) +
+        ",\"time\":" + time +
+        ",\"header\":\"mapgit:v1 manifest:" + manifestSha + " blob:" + blobSha + "\"}";
+    string localSha = Crypto::Sha256(commitJson);
+    MG_WriteTextFile(repoDir + "/commits/" + localSha + ".json", commitJson);
+    return localSha;
+}
+
+string g_ghCurImportSha = ""; // git sha of the commit currently being imported
+
+void GH_PullCoro() {
+    if (g_ghBusy) return;
+    startnew(GH_PullWork);
+}
+
+void GH_PullWork() {
+    g_ghBusy = true;
+    g_ghStatus = "pulling...";
+    CGameCtnChallenge@ map = GetMap();
+    if (map is null) { MG_Log("pull: no map open"); g_ghBusy = false; g_ghStatus = "no map"; return; }
+    if (S_GHToken.Length == 0) { MG_Log("pull: log in first"); g_ghBusy = false; g_ghStatus = "not logged in"; return; }
+    if (g_ghLogin.Length == 0) {
+        Json::Value@ me = GH_Api("GET", "https://api.github.com/user", "");
+        if (me is null) { g_ghBusy = false; g_ghStatus = "auth failed"; return; }
+        g_ghLogin = me["login"];
+    }
+
+    string repoDir = MG_ReposRoot() + "/" + MG_RepoIdFor(MG_MapFileOf(map));
+    if (!GH_ReadRemote(repoDir)) {
+        MG_Log("pull: no remote bound for this map — push first");
+        g_ghBusy = false; g_ghStatus = "no remote"; return;
+    }
+    string branch = MG_CurrentBranch(repoDir);
+    string localTip = MG_TipSha(repoDir, branch);
+    string lastLocal, lastGit;
+    GH_ReadRemoteState(repoDir, branch, lastLocal, lastGit);
+
+    // remote ref
+    Json::Value@ ref = GH_Api("GET", GH_ApiUrl("/git/refs/heads/" + branch), "");
+    if (ref is null && g_ghLastCode == 404) {
+        MG_Log("pull: remote branch '" + branch + "' does not exist — push first");
+        g_ghBusy = false; g_ghStatus = "remote branch missing"; return;
+    }
+    if (ref is null) { g_ghBusy = false; g_ghStatus = "ref read failed"; return; }
+    string remoteGit = ref["object"]["sha"];
+    if (remoteGit == lastGit) {
+        MG_Log("pull: already up to date (" + branch + ")");
+        g_ghStatus = "up to date";
+        g_ghBusy = false;
+        return;
+    }
+
+    // list remote commits (newest first) and collect the ones past our sync point
+    Json::Value@ list = GH_Api("GET", GH_ApiUrl("/commits?sha=" + branch + "&per_page=100"), "");
+    if (list is null) { g_ghBusy = false; g_ghStatus = "commit list failed"; return; }
+    array<string> toImport;
+    bool foundBase = (lastGit.Length == 0);
+    for (uint i = 0; i < list.Length; i++) {
+        string sha = list[i]["sha"];
+        if (sha == lastGit) { foundBase = true; break; }
+        toImport.InsertLast(sha);
+    }
+    if (!foundBase) {
+        MG_Log("pull: remote history diverged from the last synced commit — merge is Phase D; refusing");
+        g_ghStatus = "diverged (merge pending)";
+        g_ghBusy = false;
+        return;
+    }
+    if (toImport.Length == 0) {
+        MG_Log("pull: nothing new");
+        g_ghStatus = "up to date";
+        g_ghBusy = false;
+        return;
+    }
+
+    // import oldest-first
+    string prevLocal = (lastGit.Length > 0) ? lastLocal : "";
+    int imported = 0;
+    for (int i = int(toImport.Length) - 1; i >= 0; i--) {
+        g_ghCurImportSha = toImport[i];
+        Json::Value@ e = GH_Api("GET", GH_ApiUrl("/git/commits/" + g_ghCurImportSha), "");
+        if (e is null) { g_ghBusy = false; g_ghStatus = "commit read failed"; return; }
+        string msg = e["message"];
+        string authorName = g_ghLogin;
+        try { authorName = e["author"]["name"]; } catch { }
+        if (authorName.Length == 0) authorName = g_ghLogin;
+        string isoTime = e["committer"]["date"];
+        string newLocal = GH_ImportRemoteCommit(msg, authorName, isoTime, prevLocal);
+        if (newLocal.Length == 0) {
+            if (!msg.StartsWith("mapgit:v1")) { continue; } // bootstrap/README commit
+            MG_Log("pull: import failed at " + MG_Short(g_ghCurImportSha));
+            g_ghBusy = false; g_ghStatus = "import failed";
+            return;
+        }
+        prevLocal = newLocal;
+        imported++;
+        MG_Log("pull: imported git " + MG_Short(g_ghCurImportSha) + " -> local " + MG_Short(newLocal));
+        yield();
+    }
+
+    // fast-forward the branch when it has no unpushed local commits
+    if (localTip == lastLocal) {
+        MG_WriteTextFile(repoDir + "/refs/heads/" + branch, prevLocal);
+        g_mgRepoTip = prevLocal;
+        MG_Log("pull: fast-forwarded '" + branch + "' to " + MG_Short(prevLocal));
+
+        // if the open map is clean, restore the new tip and reopen (like checkout)
+        MG_Log("pull: checking the working map before restoring...");
+        MGManifest@ m = MG_BuildManifest(map);
+        string tmp = IO::FromStorageFolder("pull-manifest.json");
+        MG_WriteManifest(m, tmp);
+        yield();
+        string msha = MG_Sha256File(tmp);
+        string parents, tm, tb, author, message;
+        int64 time;
+        if (MG_ReadCommit(repoDir, prevLocal, parents, tm, tb, author, message, time) && tm != msha) {
+            g_ghStatus = "imported " + imported + " commits; working map dirty — commit or undo, then reopen";
+            MG_Log("pull: " + g_ghStatus);
+        } else {
+            CSystemFidFile@ mapFid = map.MapInfo.Fid;
+            string mapPath;
+            if (mapFid !is null) { mapPath = mapFid.FullFileName; }
+            else { mapPath = IO::FromUserGameFolder(MG_MapFileOf(map)); }
+            try {
+                MG_CopyFile(repoDir + "/objects/blobs/" + tb + ".gbx", mapPath);
+            } catch {
+                MG_Log("pull: failed to write the map file: " + getExceptionInfo());
+                g_ghStatus = "imported, map file write failed";
+                g_ghBusy = false;
+                return;
+            }
+            if (Permissions::OpenAdvancedMapEditor()) {
+                string mapFile = MG_MapFileOf(map);
+                auto app = cast<CGameManiaPlanet>(GetApp());
+                app.BackToMainMenu();
+                while (!app.ManiaTitleControlScriptAPI.IsReady) yield();
+                while (app.Switcher.ModuleStack.Length < 1 || cast<CTrackManiaMenus>(app.Switcher.ModuleStack[0]) is null) yield();
+                yield();
+                app.ManiaTitleControlScriptAPI.EditMap(mapFile, "", "");
+                uint waited = 0;
+                while (GetMap() is null && waited < 3000) { yield(); waited++; }
+                MG_Log("pull: reopened the map at " + MG_Short(prevLocal));
+            }
+            g_ghStatus = "pulled " + imported + " commits (" + branch + ")";
+        }
+    } else {
+        g_ghStatus = "imported " + imported + " commits; local branch has unpushed commits — branch head kept (merge: Phase D)";
+        MG_Log("pull: " + g_ghStatus);
+    }
+
+    GH_WriteRemoteState(repoDir, branch, prevLocal, remoteGit);
+    MG_Log("pull: done — " + g_ghStatus);
+    g_ghBusy = false;
+}
+
 // ------------------------- UI -------------------------
 
 void RenderGitHubTab() {
@@ -465,6 +712,8 @@ void RenderGitHubTab() {
         UI::Text("Remote: " + g_ghOwner + "/" + g_ghRepo + "  (branch " + MG_CurrentBranch(repoDir) + ")");
         UI::BeginDisabled(g_ghBusy || S_GHToken.Length == 0);
         if (UI::Button("Push current branch")) GH_PushCoro();
+        UI::SameLine();
+        if (UI::Button("Pull current branch")) GH_PullCoro();
         UI::EndDisabled();
     } else {
         UI::Text("First push — creates a repository for this map:");
