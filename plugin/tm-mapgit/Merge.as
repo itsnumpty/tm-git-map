@@ -494,6 +494,39 @@ void MG_RunMerge(MGManifest@ baseMan, MGManifest@ oursMan, MGManifest@ theirsMan
 
 // ------------------------- resolution finalize -------------------------
 
+// Strips a trailing "#N" duplicate suffix (keeps ghost "#gh" and unsuffixed keys).
+string MG_BaseKey(const string&in key) {
+    int h = -1;
+    for (int i = int(key.Length) - 1; i >= 0; i--) {
+        if (key.SubStr(i, 1) == "#") { h = i; break; }
+    }
+    if (h < 0 || h + 1 >= int(key.Length)) return key;
+    for (int i = h + 1; i < int(key.Length); i++) {
+        string ch = key.SubStr(i, 1);
+        if (ch != "0" && ch != "1" && ch != "2" && ch != "3" && ch != "4" &&
+            ch != "5" && ch != "6" && ch != "7" && ch != "8" && ch != "9") {
+            return key; // e.g. "#gh" — not a duplicate suffix
+        }
+    }
+    return key.SubStr(0, h);
+}
+
+// Restores the canonical form (the C# engine's ToManifest step): base keys,
+// canonical sort, deterministic re-suffixing. Without this, merged manifests
+// list appended theirs-entries out of order and never hash-match a rebuild.
+void MG_Recanonicalize(MGManifest@ m) {
+    for (uint i = 0; i < m.blocks.Length; i++) {
+        m.blocks[i].key = MG_BaseKey(m.blocks[i].key);
+    }
+    m.blocks.SortAsc();
+    MG_SuffixBlocks(m.blocks);
+    for (uint i = 0; i < m.items.Length; i++) {
+        m.items[i].key = MG_BaseKey(m.items[i].key);
+    }
+    m.items.SortAsc();
+    MG_SuffixItems(m.items);
+}
+
 // Applies conflict resolutions onto g_mgMergedClean, producing the final manifest.
 MGManifest@ MG_FinalizeMerged() {
     for (uint ci = 0; ci < g_mgConflicts.Length; ci++) {
@@ -533,6 +566,7 @@ MGManifest@ MG_FinalizeMerged() {
             }
         }
     }
+    MG_Recanonicalize(g_mgMergedClean);
     return g_mgMergedClean;
 }
 
