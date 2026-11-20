@@ -96,6 +96,10 @@ MGManifest@ MG_ReadManifest(const string&in path) {
 
 // ------------------------- equality (C# JsonNode.DeepEquals equivalent) -------------------------
 
+bool MG_Vec3Eq(const vec3&in a, const vec3&in b) {
+    return a.x == b.x && a.y == b.y && a.z == b.z;
+}
+
 bool MG_BlockEquals(const MGBlock&in a, const MGBlock&in b) {
     if (a.key != b.key || a.name != b.name) return false;
     if (a.isFree != b.isFree || a.isGhost != b.isGhost || a.isGround != b.isGround) return false;
@@ -103,14 +107,14 @@ bool MG_BlockEquals(const MGBlock&in a, const MGBlock&in b) {
     if (a.direction != b.direction || a.variant != b.variant || a.subVariant != b.subVariant) return false;
     if (a.color != b.color || a.lmQual != b.lmQual) return false;
     if (a.hasFree != b.hasFree) return false;
-    if (a.hasFree && (!(a.freePos == b.freePos) || !(a.freeRot == b.freeRot))) return false;
+    if (a.hasFree && (!MG_Vec3Eq(a.freePos, b.freePos) || !MG_Vec3Eq(a.freeRot, b.freeRot))) return false;
     if (a.hasSkin != b.hasSkin || a.hasWaypointProps != b.hasWaypointProps) return false;
     return true;
 }
 
 bool MG_ItemEquals(const MGItem&in a, const MGItem&in b) {
     if (a.key != b.key || a.itemModel != b.itemModel) return false;
-    if (!(a.position == b.position) || !(a.rotation == b.rotation)) return false;
+    if (!MG_Vec3Eq(a.position, b.position) || !MG_Vec3Eq(a.rotation, b.rotation)) return false;
     if (a.scale != b.scale || a.color != b.color || a.lmQual != b.lmQual) return false;
     if (a.hasWaypointProps != b.hasWaypointProps) return false;
     return true;
@@ -449,10 +453,11 @@ void MG_RunMerge(MGManifest@ baseMan, MGManifest@ oursMan, MGManifest@ theirsMan
         }
     }
 
-    // mapInfo fields (base -> theirs)
+    // mapInfo fields (base -> theirs). nbLaps/isLapRace are excluded: const in the
+    // game API — the plugin cannot apply their changes to the live map.
     array<string> fields = { "name", "comments", "collection", "decoration", "titleId", "authorLogin",
                              "mapType", "mapStyle", "authorTimeMs", "goldTimeMs", "silverTimeMs",
-                             "bronzeTimeMs", "nbLaps", "isLapRace", "createdWithSimpleEditor" };
+                             "bronzeTimeMs", "createdWithSimpleEditor" };
     for (uint f = 0; f < fields.Length; f++) {
         string field = fields[f];
         string baseVal = MG_MapInfoFieldStr(baseMan.mapInfo, field);
@@ -756,14 +761,14 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
         }
     }
 
-    // mapInfo: set writable members where final differs
+    // mapInfo: set writable members where final differs.
+    // NOTE: TMObjective_NbLaps/IsLapRace are const in the game API (not writable
+    // in-game) — they are excluded from merging entirely (see MG_RunMerge fields).
     if (final.mapInfo !is null) {
         string curName = map.MapName;
         if (curName != final.mapInfo.name) map.MapName = final.mapInfo.name;
         string curComments = map.Comments;
         if (curComments != final.mapInfo.comments) map.Comments = final.mapInfo.comments;
-        if (map.TMObjective_NbLaps != final.mapInfo.nbLaps) map.TMObjective_NbLaps = final.mapInfo.nbLaps;
-        if (map.TMObjective_IsLapRace != final.mapInfo.isLapRace) map.TMObjective_IsLapRace = final.mapInfo.isLapRace;
         if (final.mapInfo.authorTimeMs >= 0) map.TMObjective_AuthorTime = uint(final.mapInfo.authorTimeMs);
         if (final.mapInfo.goldTimeMs >= 0) map.TMObjective_GoldTime = uint(final.mapInfo.goldTimeMs);
         if (final.mapInfo.silverTimeMs >= 0) map.TMObjective_SilverTime = uint(final.mapInfo.silverTimeMs);
