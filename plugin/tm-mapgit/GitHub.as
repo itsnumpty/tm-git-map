@@ -22,6 +22,7 @@ string g_ghStatus = "not connected";
 bool g_ghBusy = false;
 string g_ghRepoName = "";
 bool g_ghPrivate = true;
+string g_ghExistingRepo = ""; // "owner/name" to bind without creating
 int g_ghLastCode = 0;
 
 // ------------------------- device flow (S12-verified pattern) -------------------------
@@ -226,25 +227,35 @@ void GH_PushWork() {
     string tip = MG_TipSha(repoDir, branch);
     if (tip.Length == 0) { MG_Log("push: no commits on '" + branch + "' — commit first"); g_ghBusy = false; g_ghStatus = "no commits"; return; }
 
-    // remote binding: create the repo on first push
+    // remote binding: create the repo on first push, or bind to an existing one
     if (!GH_ReadRemote(repoDir)) {
-        string name = GH_SanitizeRepoName(g_ghRepoName);
-        if (name.Length == 0) { MG_Log("push: enter a repository name first"); g_ghBusy = false; g_ghStatus = "need repo name"; return; }
-        MG_Log("push: creating repository '" + name + "' (" + (g_ghPrivate ? "private" : "public") + ")...");
-        string mapName = map.MapName; // wstring -> string (no Replace on wstring)
-        string body = "{\"name\":\"" + name + "\",\"private\":" + (g_ghPrivate ? "true" : "false") +
-            ",\"description\":\"MapGit repository for " + mapName.Replace("\"", "'") +
-            "\",\"has_issues\":false,\"has_wiki\":false}";
-        Json::Value@ created = GH_Api("POST", "https://api.github.com/user/repos", body);
-        if (created is null) {
-            g_ghStatus = "repo creation failed (name taken?)";
-            g_ghBusy = false;
-            return;
+        if (g_ghOwner.Length > 0 && g_ghRepo.Length > 0) {
+            // pre-bound via the "existing repository" input
+            GH_WriteRemote(repoDir);
+            MG_Log("push: bound to existing " + g_ghOwner + "/" + g_ghRepo);
+        } else {
+            if (S_GHClientId.SubStr(0, 2) == "Iv") {
+                MG_Log("push: client id is a GitHub App (Iv...) — its tokens cannot create repositories; "
+                       "use a classic OAuth App or the existing-repository option");
+            }
+            string name = GH_SanitizeRepoName(g_ghRepoName);
+            if (name.Length == 0) { MG_Log("push: enter a repository name first"); g_ghBusy = false; g_ghStatus = "need repo name"; return; }
+            MG_Log("push: creating repository '" + name + "' (" + (g_ghPrivate ? "private" : "public") + ")...");
+            string mapName = map.MapName; // wstring -> string (no Replace on wstring)
+            string body = "{\"name\":\"" + name + "\",\"private\":" + (g_ghPrivate ? "true" : "false") +
+                ",\"description\":\"MapGit repository for " + mapName.Replace("\"", "'") +
+                "\",\"has_issues\":false,\"has_wiki\":false}";
+            Json::Value@ created = GH_Api("POST", "https://api.github.com/user/repos", body);
+            if (created is null) {
+                g_ghStatus = "repo creation failed (name taken?)";
+                g_ghBusy = false;
+                return;
+            }
+            g_ghOwner = g_ghLogin;
+            g_ghRepo = name;
+            GH_WriteRemote(repoDir);
+            MG_Log("push: created " + g_ghOwner + "/" + g_ghRepo);
         }
-        g_ghOwner = g_ghLogin;
-        g_ghRepo = name;
-        GH_WriteRemote(repoDir);
-        MG_Log("push: created " + g_ghOwner + "/" + g_ghRepo);
     }
 
     // remote state for this branch
@@ -371,6 +382,26 @@ string GH_UploadFileBlob(const string&in path) {
     return sha;
 }
 
+// Bind to an existing "owner/name" repository (no creation), then push.
+void GH_BindExistingCoro() {
+    g_ghBusy = true;
+    string input = g_ghExistingRepo.Replace("\\", "/").Replace("https://github.com/", "").Replace(" ", "");
+    // accept "owner/name", "github.com/owner/name", or a full URL tail
+    string[] parts = input.Split("/");
+    if (parts.Length >= 2) {
+        g_ghOwner = parts[parts.Length - 2];
+        g_ghRepo = parts[parts.Length - 1];
+    }
+    if (g_ghOwner.Length == 0 || g_ghRepo.Length == 0 || g_ghOwner == "github.com") {
+        MG_Log("push: enter the repository as owner/name (e.g. itsnumpty/Ninconpoop-TEST)");
+        g_ghBusy = false;
+        return;
+    }
+    MG_Log("push: using existing repository " + g_ghOwner + "/" + g_ghRepo);
+    g_ghBusy = false;
+    GH_PushWork();
+}
+
 // ------------------------- UI -------------------------
 
 void RenderGitHubTab() {
@@ -419,6 +450,14 @@ void RenderGitHubTab() {
         g_ghPrivate = UI::Checkbox("Private", g_ghPrivate);
         UI::BeginDisabled(g_ghBusy || S_GHToken.Length == 0 || g_ghRepoName.Length == 0);
         if (UI::Button("Create repository & push")) GH_PushCoro();
+        UI::EndDisabled();
+
+        UI::Text("or push to an existing repository (GitHub App tokens cannot create repos):");
+        UI::SetNextItemWidth(280);
+        g_ghExistingRepo = UI::InputText("##gh-existing", g_ghExistingRepo, changed);
+        UI::SameLine();
+        UI::BeginDisabled(g_ghBusy || S_GHToken.Length == 0);
+        if (UI::Button("Bind & push")) startnew(GH_BindExistingCoro);
         UI::EndDisabled();
     }
 
