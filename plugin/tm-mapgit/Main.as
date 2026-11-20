@@ -23,6 +23,7 @@ void RenderMenu() {
 }
 
 void Render() {
+    MG_DrawConflictMarkersFrame(); // 3D conflict wireframes (draws even with the window closed)
     if (!g_windowVisible) return;
     UI::SetNextWindowSize(600, 520, UI::Cond::FirstUseEver);
     UI::Begin(Icons::CodeBranch + " MapGit", g_windowVisible);

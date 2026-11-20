@@ -162,6 +162,10 @@ class MGMergeConflict {
     MGBlock@ theirsBlock;  // for block conflicts
     MGItem@ theirsItem;    // for item conflicts
     int resolution;        // 0 unresolved, 1 ours, 2 theirs, 3 both, 4 none
+    vec3 oursPos;          // world position for the camera jump + green wireframe
+    bool hasOursPos;
+    vec3 theirsPos;        // world position for the camera jump + red ghost wireframe
+    bool hasTheirsPos;
 }
 
 string MG_KindName(int kind) {
@@ -171,6 +175,87 @@ string MG_KindName(int kind) {
     if (kind == 3) return "delete/modify";
     if (kind == 4) return "metadata";
     return "embedded";
+}
+
+// ------------------------- conflict world positions -------------------------
+
+vec3 MG_BlockWorldPos(const MGBlock&in b) {
+    if (b.isFree) return b.freePos + vec3(0, 56, 0);          // back to E++ memory space
+    return Editor::CoordToPos(nat3(b.cx, b.cy, b.cz));        // verified grid conversion
+}
+
+vec3 MG_ItemWorldPos(const MGItem&in i) {
+    return i.position; // items' manifest position IS the render-space position
+}
+
+void MG_JumpCamera(const vec3&in target) {
+    try {
+        Editor::SetCamAnimationGoTo(Editor::DirToLookUvFromCamera(target), target + vec3(0, 64, 128), 192.0);
+    } catch {
+        MG_Log("merge: camera jump failed: " + getExceptionInfo());
+    }
+}
+
+// Draws unresolved conflicts as 3D wireframes every frame (called from Render()):
+// green box = ours (in place), red ghost box = theirs. Resolved ones vanish.
+void MG_DrawConflictMarkersFrame() {
+    if (!g_mgMergeActive || g_mgConflicts.Length == 0) return;
+
+    auto theirsDI = Editor::DrawLinesAndQuads::GetOrCreateDrawInstance("mapgit-merge-theirs");
+    if (theirsDI is null) return;
+    theirsDI.ResetLines();
+    theirsDI.RequestLineColor(vec3(1, 0.25, 0.25)); // red — theirs (ghost)
+    bool anyTheirs = false;
+
+    auto oursDI = Editor::DrawLinesAndQuads::GetOrCreateDrawInstance("mapgit-merge-ours");
+    if (oursDI is null) return;
+    oursDI.ResetLines();
+    oursDI.RequestLineColor(vec3(0.3, 1, 0.4)); // green — ours (in place)
+    bool anyOurs = false;
+
+    vec3 h = vec3(16, 4, 16); // half extents of a 32x8x32 block cell
+
+    for (uint ci = 0; ci < g_mgConflicts.Length; ci++) {
+        MGMergeConflict@ c = g_mgConflicts[ci];
+        if (c.resolution != 0) continue; // resolved — no marker
+
+        if (c.hasTheirsPos) {
+            vec3 a = c.theirsPos - h;
+            vec3 b = c.theirsPos + h;
+            theirsDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(b.x, a.y, a.z));
+            theirsDI.PushLineSegment(vec3(a.x, b.y, a.z), vec3(b.x, b.y, a.z));
+            theirsDI.PushLineSegment(vec3(a.x, a.y, b.z), vec3(b.x, a.y, b.z));
+            theirsDI.PushLineSegment(vec3(a.x, b.y, b.z), vec3(b.x, b.y, b.z));
+            theirsDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(a.x, b.y, a.z));
+            theirsDI.PushLineSegment(vec3(b.x, a.y, a.z), vec3(b.x, b.y, a.z));
+            theirsDI.PushLineSegment(vec3(a.x, a.y, b.z), vec3(a.x, b.y, b.z));
+            theirsDI.PushLineSegment(vec3(b.x, a.y, b.z), vec3(b.x, b.y, b.z));
+            theirsDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(a.x, a.y, b.z));
+            theirsDI.PushLineSegment(vec3(b.x, a.y, a.z), vec3(b.x, a.y, b.z));
+            theirsDI.PushLineSegment(vec3(a.x, b.y, a.z), vec3(a.x, b.y, b.z));
+            theirsDI.PushLineSegment(vec3(b.x, b.y, a.z), vec3(b.x, b.y, b.z));
+            anyTheirs = true;
+        }
+        if (c.hasOursPos) {
+            vec3 a = c.oursPos - h;
+            vec3 b = c.oursPos + h;
+            oursDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(b.x, a.y, a.z));
+            oursDI.PushLineSegment(vec3(a.x, b.y, a.z), vec3(b.x, b.y, a.z));
+            oursDI.PushLineSegment(vec3(a.x, a.y, b.z), vec3(b.x, a.y, b.z));
+            oursDI.PushLineSegment(vec3(a.x, b.y, b.z), vec3(b.x, b.y, b.z));
+            oursDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(a.x, b.y, a.z));
+            oursDI.PushLineSegment(vec3(b.x, a.y, a.z), vec3(b.x, b.y, a.z));
+            oursDI.PushLineSegment(vec3(a.x, a.y, b.z), vec3(a.x, b.y, b.z));
+            oursDI.PushLineSegment(vec3(b.x, a.y, b.z), vec3(b.x, b.y, b.z));
+            oursDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(a.x, a.y, b.z));
+            oursDI.PushLineSegment(vec3(b.x, a.y, a.z), vec3(b.x, a.y, b.z));
+            oursDI.PushLineSegment(vec3(a.x, b.y, a.z), vec3(a.x, b.y, b.z));
+            oursDI.PushLineSegment(vec3(b.x, b.y, a.z), vec3(b.x, b.y, b.z));
+            anyOurs = true;
+        }
+    }
+    if (anyTheirs) theirsDI.Draw();
+    if (anyOurs) oursDI.Draw();
 }
 
 // ------------------------- merge state -------------------------
@@ -299,6 +384,8 @@ void MG_MergeKeyedBlocks(MGBlockIndex@ b, MGBlockIndex@ o, MGBlockIndex@ t,
             c.kind = 0; c.section = "block"; c.key = key;
             c.oursSummary = o.src[oi].name; c.theirsSummary = t.src[ti].name;
             @c.theirsBlock = t.src[ti];
+            c.oursPos = MG_BlockWorldPos(o.src[oi]); c.hasOursPos = true;
+            c.theirsPos = MG_BlockWorldPos(t.src[ti]); c.hasTheirsPos = true;
             g_mgConflicts.InsertLast(c);
         }
     } else if (changeKind == MG_CHANGE::Removed) {
@@ -313,6 +400,7 @@ void MG_MergeKeyedBlocks(MGBlockIndex@ b, MGBlockIndex@ o, MGBlockIndex@ t,
             MGMergeConflict@ c = MGMergeConflict();
             c.kind = 2; c.section = "block"; c.key = key;
             c.oursSummary = o.src[oi].name; c.theirsSummary = "(deleted)"; c.baseSummary = b.src[bi].name;
+            c.oursPos = MG_BlockWorldPos(o.src[oi]); c.hasOursPos = true;
             g_mgConflicts.InsertLast(c);
         }
     } else { // Modified
@@ -321,6 +409,7 @@ void MG_MergeKeyedBlocks(MGBlockIndex@ b, MGBlockIndex@ o, MGBlockIndex@ t,
             c.kind = 3; c.section = "block"; c.key = key;
             c.oursSummary = "(deleted)"; c.theirsSummary = t.src[ti].name; c.baseSummary = b.src[bi].name;
             @c.theirsBlock = t.src[ti];
+            c.theirsPos = MG_BlockWorldPos(t.src[ti]); c.hasTheirsPos = true;
             g_mgConflicts.InsertLast(c);
             return;
         }
@@ -337,6 +426,8 @@ void MG_MergeKeyedBlocks(MGBlockIndex@ b, MGBlockIndex@ o, MGBlockIndex@ t,
             c.kind = 1; c.section = "block"; c.key = key;
             c.oursSummary = o.src[oi].name; c.theirsSummary = t.src[ti].name; c.baseSummary = b.src[bi].name;
             @c.theirsBlock = t.src[ti];
+            c.oursPos = MG_BlockWorldPos(o.src[oi]); c.hasOursPos = true;
+            c.theirsPos = MG_BlockWorldPos(t.src[ti]); c.hasTheirsPos = true;
             g_mgConflicts.InsertLast(c);
         }
     }
@@ -358,6 +449,8 @@ void MG_MergeKeyedItems(MGItemIndex@ b, MGItemIndex@ o, MGItemIndex@ t,
             c.kind = 0; c.section = "item"; c.key = key;
             c.oursSummary = o.src[oi].itemModel; c.theirsSummary = t.src[ti].itemModel;
             @c.theirsItem = t.src[ti];
+            c.oursPos = MG_ItemWorldPos(o.src[oi]); c.hasOursPos = true;
+            c.theirsPos = MG_ItemWorldPos(t.src[ti]); c.hasTheirsPos = true;
             g_mgConflicts.InsertLast(c);
         }
     } else if (changeKind == MG_CHANGE::Removed) {
@@ -371,6 +464,7 @@ void MG_MergeKeyedItems(MGItemIndex@ b, MGItemIndex@ o, MGItemIndex@ t,
             MGMergeConflict@ c = MGMergeConflict();
             c.kind = 2; c.section = "item"; c.key = key;
             c.oursSummary = o.src[oi].itemModel; c.theirsSummary = "(deleted)";
+            c.oursPos = MG_ItemWorldPos(o.src[oi]); c.hasOursPos = true;
             g_mgConflicts.InsertLast(c);
         }
     } else { // Modified
@@ -379,6 +473,7 @@ void MG_MergeKeyedItems(MGItemIndex@ b, MGItemIndex@ o, MGItemIndex@ t,
             c.kind = 3; c.section = "item"; c.key = key;
             c.oursSummary = "(deleted)"; c.theirsSummary = t.src[ti].itemModel;
             @c.theirsItem = t.src[ti];
+            c.theirsPos = MG_ItemWorldPos(t.src[ti]); c.hasTheirsPos = true;
             g_mgConflicts.InsertLast(c);
             return;
         }
@@ -394,6 +489,8 @@ void MG_MergeKeyedItems(MGItemIndex@ b, MGItemIndex@ o, MGItemIndex@ t,
             c.kind = 1; c.section = "item"; c.key = key;
             c.oursSummary = o.src[oi].itemModel; c.theirsSummary = t.src[ti].itemModel;
             @c.theirsItem = t.src[ti];
+            c.oursPos = MG_ItemWorldPos(o.src[oi]); c.hasOursPos = true;
+            c.theirsPos = MG_ItemWorldPos(t.src[ti]); c.hasTheirsPos = true;
             g_mgConflicts.InsertLast(c);
         }
     }
@@ -1058,6 +1155,17 @@ void RenderMergeSection() {
                 MGMergeConflict@ c = g_mgConflicts[i];
                 UI::Text("  - " + MG_KindName(c.kind) + "  " + c.key +
                          "   [ours: " + c.oursSummary + "  theirs: " + c.theirsSummary + "]");
+                if (c.hasOursPos) {
+                    UI::SameLine();
+                    if (UI::Button("\\$0f2go ours##o" + i)) MG_JumpCamera(c.oursPos);
+                    if (UI::IsItemHovered()) UI::SetTooltip("Ours (green box in the world): " + c.oursSummary);
+                }
+                if (c.hasTheirsPos) {
+                    UI::SameLine();
+                    if (UI::Button("\\$f42go theirs##t" + i)) MG_JumpCamera(c.theirsPos);
+                    if (UI::IsItemHovered()) UI::SetTooltip("Theirs (red ghost box): " + c.theirsSummary +
+                        " — not placed yet; it only exists on the other version line");
+                }
                 UI::SameLine();
                 MG_ResolutionButton(c, 1, "Ours");
                 UI::SameLine();
@@ -1068,6 +1176,11 @@ void RenderMergeSection() {
                 }
                 UI::SameLine();
                 MG_ResolutionButton(c, 4, "None");
+                if (c.resolution != 0) {
+                    UI::SameLine();
+                    UI::TextDisabled("-> " + (c.resolution == 1 ? "ours" : c.resolution == 2 ? "theirs" :
+                                              c.resolution == 3 ? "both" : "none"));
+                }
             }
             UI::BeginDisabled(g_mgRepoBusy || !allResolved);
             if (UI::Button(T("Apply resolution", "Commit merge"))) MG_ApplyMergeCoro();
