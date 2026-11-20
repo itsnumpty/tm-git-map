@@ -180,8 +180,8 @@ string MG_KindName(int kind) {
 // ------------------------- conflict world positions -------------------------
 
 vec3 MG_BlockWorldPos(const MGBlock&in b) {
-    if (b.isFree) return b.freePos + vec3(0, 56, 0);          // back to E++ memory space
-    return Editor::CoordToPos(nat3(b.cx, b.cy, b.cz));        // verified grid conversion
+    if (b.isFree) return b.freePos + vec3(0, 56, 0);   // back to E++ memory space
+    return CoordToPos(nat3(b.cx, b.cy, b.cz)) + vec3(16, 4, 16); // global fn + half cell = center
 }
 
 vec3 MG_ItemWorldPos(const MGItem&in i) {
@@ -957,6 +957,17 @@ void MG_MergeCoro() {
 
 void MG_MergeWork() {
     g_mgRepoBusy = true;
+    try {
+        MG_MergeWorkInner();
+    } catch {
+        MG_Log("merge: EXCEPTION - " + getExceptionInfo());
+        MG_ClearMergeState();
+        g_mgMergeStatus = "merge failed (exception - see log)";
+        g_mgRepoBusy = false;
+    }
+}
+
+void MG_MergeWorkInner() {
     g_mgMergeStatus = "combining...";
     CGameCtnChallenge@ map = GetMap();
     if (map is null) { MG_Log("merge: no map open"); g_mgRepoBusy = false; g_mgMergeStatus = "no map"; return; }

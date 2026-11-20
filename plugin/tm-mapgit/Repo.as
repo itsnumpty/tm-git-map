@@ -348,6 +348,10 @@ void MG_CreateBranchCoro() {
     g_mgNewBranch = "";
     g_mgRepoBranch = name;
     MG_LoadBranches(repoDir);
+    // keep the switch/checkout dropdown in sync with the new current line
+    for (uint i = 0; i < g_mgBranches.Length; i++) {
+        if (g_mgBranches[i] == name) g_mgSelBranch = int(i);
+    }
     MG_Log("branch: created + switched to '" + name + "' at " + MG_Short(tip));
     g_mgRepoBusy = false;
 }
@@ -437,6 +441,9 @@ void MG_CheckoutCoro() {
     }
     g_mgRepoBranch = target;
     MG_LoadBranches(repoDir);
+    for (uint i = 0; i < g_mgBranches.Length; i++) {
+        if (g_mgBranches[i] == target) g_mgSelBranch = int(i);
+    }
     MG_Log("checkout: now on '" + target + "' at " + MG_Short(tTip));
     g_mgRepoBusy = false;
     MG_RefreshStatusCoro();
@@ -444,12 +451,39 @@ void MG_CheckoutCoro() {
 
 // ------------------------- UI -------------------------
 
+string g_mgAutoRepoKey = ""; // last repo the tab auto-loaded (fast, no manifest build)
+
+// Instant state load when the tab opens on a map it hasn't seen yet (per session).
+// No EnsureRepo here: opening a random map must not create a repo directory.
+void MG_AutoLoadRepoState(CGameCtnChallenge@ map) {
+    string mapFile = MG_MapFileOf(map);
+    string repoId = MG_RepoIdFor(mapFile);
+    if (repoId == g_mgAutoRepoKey) return;
+    g_mgAutoRepoKey = repoId;
+    g_mgRepoId = repoId;
+    string repoDir = MG_ReposRoot() + "/" + repoId;
+    if (IO::FolderExists(repoDir)) {
+        g_mgRepoBranch = MG_CurrentBranch(repoDir);
+        g_mgRepoTip = MG_TipSha(repoDir, g_mgRepoBranch);
+        MG_LoadBranches(repoDir);
+        for (uint i = 0; i < g_mgBranches.Length; i++) {
+            if (g_mgBranches[i] == g_mgRepoBranch) g_mgSelBranch = int(i);
+        }
+    } else {
+        g_mgRepoBranch = "main";
+        g_mgRepoTip = "";
+        g_mgBranches.RemoveRange(0, g_mgBranches.Length);
+        g_mgRepoStatusText = "no versions yet — " + T("Save version", "Commit") + " to start tracking this map";
+    }
+}
+
 void RenderRepoTab() {
     CGameCtnChallenge@ map = GetMap();
     if (map is null) {
         UI::Text("Open the map editor to use MapGit.");
         return;
     }
+    MG_AutoLoadRepoState(map);
     if (g_mgRepoId.Length == 0) {
         g_mgRepoId = MG_RepoIdFor(MG_MapFileOf(map));
     }
