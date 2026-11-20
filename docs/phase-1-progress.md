@@ -60,10 +60,27 @@ against the C# engine manifest on Ninconpoop TEST closed every systematic gap:
 - **Silent saves after edits write the baked form** (852 KB → 175 KB): complete and
   manifest-stable per the engine round-trip. The blob (restore point) churns its hash
   every save (uid + form), the manifest is the stable identity — by design.
-- Additional mapInfo fields closed: decoration (DecorationName), titleId, authorLogin,
-  mapType, mapStyle, createdWithSimpleEditor.
-- Free-position −56 correction is likely `map.Collection.TerrainHeightOffset` (Stadium2020
-  collection property); diag line added to confirm, then replace the constant.
+- Additional mapInfo fields closed: decoration (DecorationName — matches the engine's
+  meta id exactly), titleId, authorLogin, mapType, mapStyle, createdWithSimpleEditor.
+- Free-position −56 is NOT `Collection.TerrainHeightOffset` (diag reads 1 for
+  Stadium2020); it stays an empirical 7-cell constant for the Stadium2020 collection —
+  re-verify for other collections.
+
+### Phase B.3 (2026-11-20) — branches + checkout: verified
+
+- `Create branch` (checkout -b semantics) + branch dropdown (refs/heads via IO::IndexFolder).
+- `Checkout` = dirty refusal (live manifest vs current tip) → restore the target branch's
+  blob to the map file → HEAD switch → editor reopen via the S9 mechanism → auto status
+  refresh. Full demo verified: commit → branch experiment → edit → commit → checkout main
+  (editor reloads, experiment blocks gone, clean) → checkout experiment (blocks back,
+  clean) → same-branch checkout no-ops.
+- **Manifest stability across save→disk→reload proven in-plugin**: after each checkout the
+  rebuilt manifest hashes exactly to the committed manifest (c4c5e7da, bf4794f7cd).
+- AngelScript notes: `UI::Combo` doesn't exist — use BeginCombo/Selectable/EndCombo
+  (E++ pattern); wstring/string ternaries fail ("unambiguous implicit conversion") —
+  assign via if/else; `IO::FromUserGameFolder` resolves the game user folder.
+- Not yet exercised: the checkout dirty-refusal path (same comparison primitive as the
+  verified dirty detection — low risk).
 
 ## Done
 

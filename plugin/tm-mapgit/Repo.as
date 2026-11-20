@@ -388,7 +388,12 @@ void MG_CheckoutCoro() {
     string blobPath = repoDir + "/objects/blobs/" + tBlob + ".gbx";
     if (!IO::FileExists(blobPath)) { MG_Log("checkout: blob missing: " + blobPath); g_mgRepoBusy = false; return; }
     CSystemFidFile@ mapFid = map.MapInfo.Fid;
-    string mapPath = (mapFid !is null) ? mapFid.FullFileName : IO::FromUserGameFolder(mapFile);
+    string mapPath;
+    if (mapFid !is null) {
+        mapPath = mapFid.FullFileName;
+    } else {
+        mapPath = IO::FromUserGameFolder(mapFile);
+    }
     try {
         MG_CopyFile(blobPath, mapPath);
     } catch {
@@ -459,7 +464,15 @@ void RenderRepoTab() {
     if (g_mgBranches.Length == 0) {
         UI::TextDisabled("  (refresh status to load)");
     } else {
-        g_mgSelBranch = UI::Combo("##mg-branch", g_mgBranches, g_mgSelBranch);
+        if (g_mgSelBranch < 0 || g_mgSelBranch >= int(g_mgBranches.Length)) g_mgSelBranch = 0;
+        if (UI::BeginCombo("##mg-branch", g_mgBranches[g_mgSelBranch])) {
+            for (uint i = 0; i < g_mgBranches.Length; i++) {
+                if (UI::Selectable(g_mgBranches[i], int(i) == g_mgSelBranch)) {
+                    g_mgSelBranch = int(i);
+                }
+            }
+            UI::EndCombo();
+        }
         UI::BeginDisabled(g_mgRepoBusy);
         UI::SameLine();
         if (UI::Button("Checkout")) startnew(MG_CheckoutCoro);
