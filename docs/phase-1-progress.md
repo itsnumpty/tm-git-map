@@ -17,7 +17,7 @@ S12 GitHub device flow). Full-map crosscheck: engine vs plugin extraction equiva
 Key manifest consequence: plugin canonical block set = `map.Blocks` ∪ nod-identity-deduped
 `BakedBlocks` = 5603 = the engine's flat file list.
 
-## Phase B round 1 (2026-11-20) — ManifestBuilder v1 conformance
+## Phase B (2026-11-20) — ManifestBuilder + repo + branches: verified
 
 Production plugin `tm-mapgit` v0.1.0 (junctioned, E++ dependency). Round-1 conformance
 against the C# engine manifest on Ninconpoop TEST closed every systematic gap:
@@ -150,13 +150,40 @@ materializer round-trips a real free block and a real item to byte-exact manifes
 - Object files tracked by git get removed from the working tree by branch checkouts;
   the git odb (via the referencing commit) is the reliable read path.
 
+## Phase C (2026-11-20) — GitHub sync: verified
+
+- **Auth**: device flow in-plugin (classic OAuth App; client ID + hidden token settings;
+  Log out button). GitHub App (`Iv…` client ids) tokens cannot create repositories —
+  the plugin warns and offers binding to an existing repo instead.
+- **Push** (C.1): repo creation on first push (repo-per-map, name + private), incremental
+  push via the git database REST API — per MapGit commit: base64 git blobs for
+  map.Map.Gbx + manifest.json, tree, commit (message = mapgit header), ref create/force.
+  Remote state per branch in refs/remotes/origin (`<localSha> <gitSha>`). Empty repos are
+  bootstrapped via the Contents API (PUT /contents README — git database API 409s on
+  empty repos). Verified: 4-commit push to github.com/itsnumpty/Ninconpoop-TEST, remotes
+  are real cloneable git repositories.
+- **Pull** (C.2): reads the remote ref, walks the commit list to the last synced point
+  (refuses on divergence — merge is Phase D), imports each commit: parses the header
+  (fixed slices — prefix is 19 chars), downloads the map+manifest git blobs, VERIFIES
+  sha256 against the header hashes before writing, writes local objects + a canonical
+  local commit (ISO git date parsed via days-from-civil), fast-forwards when the branch
+  has no unpushed commits, then dirty-checks and restores + reopens the map.
+  Verified via disaster recovery: local store wiped → pulled 4 commits back from GitHub
+  → manifests byte-identical to the originals → map restored, editor reopened, clean.
+- AngelScript notes: `ref` is a reserved word (hit twice); Net::HttpRequest supports
+  GET/POST/PUT/PATCH via `Method = Net::HttpMethod::*`; `MemoryBuffer::ReadToBase64` /
+  `WriteFromBase64`; trim external-file trailing CRLF (Set-Content adds it — malformed
+  URLs otherwise); commit-message parsing uses validated fixed slices.
+
 ## Next (post-pivot roadmap)
 
-1. **Phase B (started)**: production plugin `tm-mapgit` — ManifestBuilder v1
-   (live map → manifest; structural conformance vs C#, byte-exact later), silent-save
-   commit flow, local object store + branches/status/log UI.
-2. Phase C: GitHub push/pull via git database REST API + repo-per-map dialog
-   (device-flow auth already proven in S12).
-3. Phase D: merge engine port (C# 37-test suite as spec) + live apply via E++ specs +
-   3D conflict markers/resolution UI.
-4. Production OAuth app registration (device flow enabled).
+1. **Phase D**: merge engine port to AngelScript (the C# ThreeWayMerge + 37-test suite
+   as the spec), live apply via E++ specs, 3D conflict markers (ours in place, theirs as
+   ghost wireframes + labels, camera tour) and ours/theirs/both/none resolution UI to
+   two-parent merge commits. Also unlock pull-divergence (currently refused).
+2. v1 gap backlog: byte-exact canonical JSON + hash equality (float formatting),
+   embedded entries (Fids byte-read + TolerantHash port), mapInfo collection
+   ("Stadium" nod name vs "Stadium2020" meta id), skins via E++ GetPackDescs, item
+   pivot, decals, macroblock refs, authorScore/playMode/cost/hasGhostBlocks.
+3. Production OAuth app registration (device flow enabled) for the released plugin +
+   clone-on-fresh-install (pull without a local remote.json binding).
