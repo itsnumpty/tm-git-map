@@ -30,6 +30,10 @@ void Render() {
         RenderRepoTab();
         UI::EndTabItem();
     }
+    if (UI::BeginTabItem("GitHub")) {
+        RenderGitHubTab();
+        UI::EndTabItem();
+    }
     UI::EndTabBar();
     UI::End();
 }
