@@ -180,8 +180,11 @@ string MG_KindName(int kind) {
 // ------------------------- conflict world positions -------------------------
 
 vec3 MG_BlockWorldPos(const MGBlock&in b) {
-    if (b.isFree) return b.freePos + vec3(0, 56, 0);   // back to E++ memory space
-    return CoordToPos(nat3(b.cx, b.cy, b.cz)) + vec3(16, 4, 16); // global fn + half cell = center
+    if (b.isFree) return b.freePos + vec3(0, 56, 0); // back to E++ memory space
+    // E++ Math.as formula: pos = (coord.x*32, coord.y*8 - baseOffset, coord.z*32)
+    // with baseOffset = -extendsBelowZero = -56 for Stadium2020 (same 7-cell constant
+    // as the free-position offset; verified against E++'s own CoordToPos definition).
+    return vec3(b.cx * 32.0 + 16.0, b.cy * 8.0 + 56.0 + 4.0, b.cz * 32.0 + 16.0);
 }
 
 vec3 MG_ItemWorldPos(const MGItem&in i) {
