@@ -477,6 +477,9 @@ void MG_AutoLoadRepoState(CGameCtnChallenge@ map) {
         }
         // automatic dirty check (runs in a coroutine; the UI stays responsive)
         if (!g_mgRepoBusy) startnew(MG_RefreshStatusCoro);
+        // check the shared map for teammate changes (one cheap GET)
+        g_mgRemoteSentence = "";
+        if (g_ghToken.Length > 0) MG_CheckRemoteCoro();
     } else {
         g_mgRepoBranch = "main";
         g_mgRepoTip = "";

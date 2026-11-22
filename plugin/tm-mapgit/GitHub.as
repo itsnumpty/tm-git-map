@@ -408,6 +408,7 @@ void GH_PushWork() {
     }
 
     GH_WriteRemoteState(repoDir, branch, tip, gitTip);
+    g_mgRemoteSentence = ""; // we just shared — the team state is now ours
     g_ghStatus = "pushed " + branch + " (" + chain.Length + " commits) to " + g_ghOwner + "/" + g_ghRepo;
     MG_Log("push: done — " + g_ghStatus);
     g_ghBusy = false;
@@ -722,6 +723,40 @@ void GH_PullWork() {
     GH_WriteRemoteState(repoDir, branch, prevLocal, remoteGit);
     MG_Log("pull: done — " + g_ghStatus);
     g_ghBusy = false;
+}
+
+// ------------------------- auth section (shared by panel + dev tab) -------------------------
+
+// Compact GitHub connection UI for the everyday panel: no client-id input (the
+// built-in app id covers normal users), just connect/log out + the device link.
+void RenderGitHubAuthSection() {
+    if (S_GHToken.Length == 0 && g_ghToken.Length == 0) {
+        UI::BeginDisabled(g_ghBusy);
+        if (UI::Button(T("Connect to GitHub", "Log in with GitHub"))) GH_StartDeviceFlow();
+        UI::EndDisabled();
+        UI::SameLine();
+        UI::TextDisabled("required once to share maps with others");
+        if (g_ghUserCode.Length > 0) {
+            UI::Text("\\$fe1 code: " + g_ghUserCode + "  (copied to clipboard)");
+            string linkUrl = (g_ghUriComplete.Length > 0) ? g_ghUriComplete : g_ghUri;
+            if (g_ghUriComplete.Length > 0) {
+                UI::TextLinkOpenURL("\\$0f0\\$iOpen github.com/login/device (code pre-filled)", linkUrl);
+            } else {
+                UI::TextLinkOpenURL("\\$0f0\\$iOpen " + g_ghUri, linkUrl);
+            }
+        }
+    } else {
+        UI::Text("\\$8f0" + "GitHub: " + (g_ghLogin.Length > 0 ? g_ghLogin : "connected"));
+        UI::SameLine();
+        if (UI::Button("Log out")) {
+            g_ghToken = "";
+            g_ghLogin = "";
+            S_GHToken = "";
+            GH_SaveToken();
+            g_ghStatus = "not connected";
+            MG_Log("GitHub: token cleared — you can log in again");
+        }
+    }
 }
 
 // ------------------------- UI -------------------------

@@ -225,6 +225,8 @@ void MG_RestoreWork() {
 
 // ------------------------- panel UI -------------------------
 
+string g_mgRemoteSentence = ""; // set by the remote check (e.g. teammates shared changes)
+
 void RenderMainPanel() {
     CGameCtnChallenge@ map = GetMap();
     if (map is null) {
@@ -236,19 +238,21 @@ void RenderMainPanel() {
     string repoId = MG_RepoIdFor(mapFile);
     string repoDir = MG_ReposRoot() + "/" + repoId;
 
-    // ---- header: the map + a status sentence ----
+    // ---- header: the map + a plain-language status ----
     UI::Text(map.MapName);
     string sentence;
     if (!IO::FolderExists(repoDir)) {
-        sentence = "This map isn't tracked yet.";
-    } else if (g_mgRepoTip.Length == 0) {
-        sentence = "Tracked — no versions yet.";
+        sentence = "MapGit isn't watching this map yet.";
     } else if (g_mgRepoBusy) {
         sentence = "Working...";
+    } else if (g_mgRemoteSentence.Length > 0) {
+        sentence = g_mgRemoteSentence;
     } else if (g_mgRepoStatusText.StartsWith("dirty")) {
-        sentence = "You have changes not shared yet.";
+        sentence = "You have changes your team can't see yet.";
     } else if (g_mgRepoStatusText.StartsWith("clean")) {
-        sentence = "\\$8f0" + "Up to date — everything is shared.";
+        sentence = "\\$8f0" + "Everyone has the same map.";
+    } else if (g_mgRepoTip.Length == 0) {
+        sentence = "No versions yet — Share to create the first one.";
     } else {
         sentence = g_mgRepoStatusText;
     }
@@ -257,25 +261,37 @@ void RenderMainPanel() {
     UI::Separator();
 
     if (!IO::FolderExists(repoDir)) {
-        // ---- first run: start tracking ----
+        // ---- first run ----
         if (UI::Button(T("Start tracking this map", "Init repository"))) {
             MG_EnsureRepo(repoDir, repoId, mapFile, map.MapName);
             MG_LoadTimeline(repoDir, MG_TipSha(repoDir, MG_CurrentBranch(repoDir)));
         }
+        UI::SameLine();
+        UI::TextDisabled("versions are stored on your PC until you Share");
+        UI::Separator();
+        RenderGitHubAuthSection();
         return;
     }
 
-    // ---- share / get ----
+    // ---- share / update ----
     bool changed;
-    UI::SetNextItemWidth(260);
+    UI::SetNextItemWidth(280);
     g_mgShareNote = UI::InputText("##share-note", g_mgShareNote, changed);
     UI::SameLine();
-    UI::TextDisabled("note (optional)");
+    UI::TextDisabled("what did you change? (optional)");
     UI::BeginDisabled(g_mgRepoBusy || g_ghBusy);
-    if (UI::Button(T("Share my changes", "Share (commit + push)"))) MG_ShareCoro();
-    UI::SameLine();
-    if (UI::Button(T("Get changes", "Download"))) MG_GetCoro();
+    if (UI::Button(T("Share", "Share (save + push)"))) MG_ShareCoro();
     UI::EndDisabled();
+    UI::SameLine();
+    UI::TextDisabled("saves your work and sends it to the shared map");
+    UI::BeginDisabled(g_mgRepoBusy || g_ghBusy);
+    if (UI::Button(T("Update", "Download"))) MG_GetCoro();
+    UI::EndDisabled();
+    UI::SameLine();
+    UI::TextDisabled("brings in changes others shared");
+
+    // ---- github connection ----
+    RenderGitHubAuthSection();
 
     // ---- stamps ----
     UI::Separator();
@@ -283,12 +299,10 @@ void RenderMainPanel() {
     g_mgStampName = UI::InputText("##stamp-name", g_mgStampName, changed);
     UI::SameLine();
     UI::BeginDisabled(g_mgRepoBusy || g_mgStampName.Length == 0);
-    if (UI::Button(T("Stamp this version", "Stamp (tag)"))) MG_StampCoro();
+    if (UI::Button(T("Stamp", "Stamp (tag)"))) MG_StampCoro();
     UI::EndDisabled();
-    if (g_mgStamps.Length == 0 && g_mgStampName.Length == 0) {
-        UI::SameLine();
-        UI::TextDisabled("name the current state to come back to it later");
-    }
+    UI::SameLine();
+    UI::TextDisabled("name a checkpoint you can return to");
 
     if (g_mgStamps.Length > 0) {
         for (uint i = 0; i < g_mgStamps.Length; i++) {
@@ -297,9 +311,8 @@ void RenderMainPanel() {
             UI::SameLine();
             UI::TextDisabled("by " + s.author + ", " + MG_TimeAgo(s.time));
             UI::SameLine();
-            bool stampBusy = g_mgRepoBusy;
-            UI::BeginDisabled(stampBusy);
-            if (UI::Button("Restore##stamp" + i)) MG_RestoreCoro(s.commit);
+            UI::BeginDisabled(g_mgRepoBusy);
+            if (UI::Button("go back to this##stamp" + i)) MG_RestoreCoro(s.commit);
             UI::EndDisabled();
         }
     }
@@ -308,21 +321,53 @@ void RenderMainPanel() {
     UI::Separator();
     UI::Text(T("Recent versions", "History") + ":");
     if (g_mgPanelLogLines.Length == 0) {
-        UI::TextDisabled("  no versions yet — " + T("share", "commit") + " to create the first one");
+        UI::TextDisabled("  nothing yet — Share to create the first version");
     } else {
         for (uint i = 0; i < g_mgPanelLogLines.Length; i++) {
             string[] parts = g_mgPanelLogLines[i].Split("|");
             if (parts.Length < 4) continue;
             string author = parts[0];
             string message = parts[1];
-            string sha = parts[3];
-            UI::Text("  " + author + "  —  " + (message.Length > 0 ? message : "(no note)"));
+            string timeStr = parts[2];
+            UI::Text("  " + author + "  —  " + (message.Length > 0 ? message : "(no note)") +
+                     "   (" + MG_TimeAgo(int64(Text::ParseInt(timeStr))) + ")");
             UI::SameLine();
             UI::BeginDisabled(g_mgRepoBusy);
-            if (UI::Button(T("restore", "restore") + "##v" + i)) MG_RestoreCoro(sha);
+            if (UI::Button(T("go back to this", "restore") + "##v" + i)) MG_RestoreCoro(parts[3]);
             UI::EndDisabled();
         }
     }
+}
+
+// Checks the shared map's remote for changes teammates made (cheap: one GET).
+void MG_CheckRemoteCoro() {
+    if (g_ghBusy) return;
+    startnew(MG_CheckRemoteWork);
+}
+
+void MG_CheckRemoteWork() {
+    g_ghBusy = true;
+    try {
+        g_mgRemoteSentence = "";
+        CGameCtnChallenge@ map = GetMap();
+        if (map is null || g_ghToken.Length == 0) { g_ghBusy = false; return; }
+        string repoDir = MG_ReposRoot() + "/" + MG_RepoIdFor(MG_MapFileOf(map));
+        if (!GH_ReadRemote(repoDir)) { g_ghBusy = false; return; } // not shared yet
+        string branch = MG_CurrentBranch(repoDir);
+        Json::Value@ remoteRef = GH_Api("GET", GH_ApiUrl("/git/refs/heads/" + branch), "");
+        if (remoteRef is null && g_ghLastCode == 404) { g_ghBusy = false; return; } // never pushed
+        if (remoteRef is null) { g_ghBusy = false; return; }
+        string remoteGit = remoteRef["object"]["sha"];
+        string lastLocal, lastGit;
+        GH_ReadRemoteState(repoDir, branch, lastLocal, lastGit);
+        if (remoteGit != lastGit) {
+            g_mgRemoteSentence = "\\$ff0" + "Your team shared new changes — Update to see them.";
+            MG_Log("remote check: new shared changes waiting");
+        }
+    } catch {
+        // never block the panel on a network hiccup
+    }
+    g_ghBusy = false;
 }
 
 string g_mgShareNote = "";
