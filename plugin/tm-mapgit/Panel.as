@@ -340,6 +340,9 @@ void RenderMainPanel() {
 }
 
 // Checks the shared map's remote for changes teammates made (cheap: one GET).
+// Called automatically every few minutes (see MG_RemoteCheckTick) and on panel load.
+string g_mgNotifiedRemoteGit = ""; // last remote tip we notified about (dedupe)
+
 void MG_CheckRemoteCoro() {
     if (g_ghBusy) return;
     startnew(MG_CheckRemoteWork);
@@ -362,12 +365,34 @@ void MG_CheckRemoteWork() {
         GH_ReadRemoteState(repoDir, branch, lastLocal, lastGit);
         if (remoteGit != lastGit) {
             g_mgRemoteSentence = "\\$ff0" + "Your team shared new changes — Update to see them.";
-            MG_Log("remote check: new shared changes waiting");
+            if (remoteGit != g_mgNotifiedRemoteGit) {
+                g_mgNotifiedRemoteGit = remoteGit; // notify once per remote tip
+                string mapName = map.MapName;
+                UI::ShowNotification("MapGit", "'" + mapName + "' — your team shared new changes. Open MapGit and Update.");
+                MG_Log("remote check: new shared changes waiting (" + MG_Short(remoteGit) + ")");
+            }
         }
     } catch {
         // never block the panel on a network hiccup
     }
     g_ghBusy = false;
+}
+
+// Per-frame scheduler gate: cheap timestamp check, real work runs in the coroutine.
+[Setting name="Check for teammate changes every N minutes (0 = off)"]
+int S_RemoteCheckMinutes = 3;
+
+int64 g_mgLastRemoteCheck = 0;
+
+void MG_RemoteCheckTick() {
+    if (S_RemoteCheckMinutes <= 0) return;
+    if (g_ghToken.Length == 0) return;
+    if (g_mgRepoBusy || g_ghBusy || g_mgMergeActive) return;
+    if (Time::Stamp - g_mgLastRemoteCheck < int64(S_RemoteCheckMinutes) * 60) return;
+    CGameCtnChallenge@ map = GetMap();
+    if (map is null) return;
+    g_mgLastRemoteCheck = Time::Stamp;
+    MG_CheckRemoteCoro();
 }
 
 string g_mgShareNote = "";

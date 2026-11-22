@@ -24,6 +24,7 @@ void RenderMenu() {
 
 void Render() {
     MG_DrawConflictMarkersFrame(); // 3D conflict wireframes (draws even with the window closed)
+    MG_RemoteCheckTick();         // periodic teammate-changes check + notification
     if (!g_windowVisible) return;
     UI::SetNextWindowSize(600, 520, UI::Cond::FirstUseEver);
     if (S_DevTools) {

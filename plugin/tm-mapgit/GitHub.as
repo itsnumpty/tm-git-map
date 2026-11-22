@@ -409,6 +409,7 @@ void GH_PushWork() {
 
     GH_WriteRemoteState(repoDir, branch, tip, gitTip);
     g_mgRemoteSentence = ""; // we just shared — the team state is now ours
+    g_mgNotifiedRemoteGit = "";
     g_ghStatus = "pushed " + branch + " (" + chain.Length + " commits) to " + g_ghOwner + "/" + g_ghRepo;
     MG_Log("push: done — " + g_ghStatus);
     g_ghBusy = false;
@@ -721,6 +722,8 @@ void GH_PullWork() {
     }
 
     GH_WriteRemoteState(repoDir, branch, prevLocal, remoteGit);
+    g_mgRemoteSentence = "";   // we just brought the team's changes in
+    g_mgNotifiedRemoteGit = "";
     MG_Log("pull: done — " + g_ghStatus);
     g_ghBusy = false;
 }
