@@ -456,9 +456,39 @@ void MG_CheckoutCoro() {
 
 string g_mgAutoRepoKey = ""; // last repo the tab auto-loaded (fast, no manifest build)
 
-// Instant state load when the tab opens on a map it hasn't seen yet (per session),
-// then kicks the full status refresh (dirty check) automatically.
-// No EnsureRepo here: opening a random map must not create a repo directory.
+// One-time adoption for the one-shared-map model: if the repo's current line
+// isn't 'main' (left over from branch-era testing), adopt its content as 'main'
+// — but only when nothing on the existing main line would be orphaned.
+bool MG_IsAncestor(const string&in repoDir, const string&in maybeAncestor, const string&in tip) {
+    string cur = tip;
+    for (uint i = 0; i < 1000 && cur.Length > 0; i++) {
+        if (cur == maybeAncestor) return true;
+        string parents, manifest, blob, author, message;
+        int64 time;
+        if (!MG_ReadCommit(repoDir, cur, parents, manifest, blob, author, message, time)) break;
+        string[] p = parents.Split(",");
+        cur = (p.Length > 0 && p[0].Length > 0) ? p[0] : "";
+    }
+    return false;
+}
+
+void MG_NormalizeToMainLine(const string&in repoDir, string&io branch) {
+    if (branch == "main") return;
+    string oldBranch = branch;
+    string tip = MG_TipSha(repoDir, branch);
+    string mainTip = MG_TipSha(repoDir, "main");
+    if (tip.Length == 0) return; // nothing on the current line — leave as is
+    bool adopt = (mainTip.Length == 0) || MG_IsAncestor(repoDir, mainTip, tip);
+    if (!adopt) {
+        MG_Log("NOTE: local '" + oldBranch + "' and 'main' have separate histories — "
+               "sort them out with the Developer tools");
+        return;
+    }
+    MG_WriteTextFile(repoDir + "/refs/heads/main", tip);
+    MG_WriteTextFile(repoDir + "/HEAD", "ref: refs/heads/main");
+    branch = "main";
+    MG_Log("adopted version line '" + oldBranch + "' as the shared 'main' line (" + MG_Short(tip) + ")");
+}
 void MG_AutoLoadRepoState(CGameCtnChallenge@ map) {
     string mapFile = MG_MapFileOf(map);
     string repoId = MG_RepoIdFor(mapFile);
@@ -468,6 +498,7 @@ void MG_AutoLoadRepoState(CGameCtnChallenge@ map) {
     string repoDir = MG_ReposRoot() + "/" + repoId;
     if (IO::FolderExists(repoDir)) {
         g_mgRepoBranch = MG_CurrentBranch(repoDir);
+        MG_NormalizeToMainLine(repoDir, g_mgRepoBranch); // one-shared-map: the line IS main
         g_mgRepoTip = MG_TipSha(repoDir, g_mgRepoBranch);
         MG_LoadBranches(repoDir);
         MG_LoadTimeline(repoDir, g_mgRepoTip);
