@@ -1,75 +1,116 @@
-# MapGit — git-style version control for Trackmania 2020 maps
+# MapGit — version control for Trackmania 2020 maps, built into the editor
 
-MapGit lets multiple mappers work on the same map **asynchronously**: checkpoint commits,
-branch, experiment, and merge — with conflicts (two people touching the same spot)
-resolved **inside the map editor**, not in a text diff.
+MapGit lets a group of mappers build **one shared map together** without anyone
+needing to know what git is. You edit; MapGit remembers every version, syncs
+with your team through GitHub, and — when two people change *the same block* —
+shows the conflict **in the 3D world** and lets you pick a winner visually.
 
-- **`src/MapGit.Core`** — manifest model, canonical JSON + hashing, keyed diff, 3-way merge, float-noise-tolerant fingerprints
-- **`src/MapGit.Gbx`** — .Map.Gbx ↔ manifest extraction, round-trip fidelity probing, headless merge materializer (GBX.NET + GBX.NET.LZO)
-- **`src/MapGit.Git`** — LibGit2Sharp backend (branches, merge commits, object storage)
-- **`src/MapGit.Repo`** — repository model: commits, branches, merge with verification, content-addressed snapshots
-- **`src/MapGit.Cli`** — `manifest`, `diff`, `probe`, `crosscheck`, `embedded`, `init`, `status`, `commit`, `log`, `branch`, `checkout`, `merge`
-- **`src/MapGit.Tray`** — tray service (next): localhost API for the plugin, map watcher, git sync
-- **`plugin/tm-mapgit-spikes`** — Openplanet (AngelScript) Phase 0 spike plugin (verified in-game)
-- **`docs/phase-0-report.md`** — Phase 0 findings · **`docs/phase-1-progress.md`** — Phase 1 status
+Everything runs inside Trackmania as an [Openplanet](https://openplanet.dev)
+plugin. No external apps, no command line, no git.
+
+## What you get
+
+- **Versions** — every share is a snapshot of the whole map. The panel shows a
+  timeline: *who* changed *what*, *when*.
+- **Share** — saves your current work and sends it to the shared map. If a
+  teammate changed something else meanwhile, both sets of changes combine
+  automatically.
+- **Update** — brings in the changes your teammates shared. The panel tells you
+  when there's something new ("Your team shared new changes — Update to see them").
+- **Stamps** — name a checkpoint (`before-rework`, `v1-beta`) and go back to it
+  any time. Going back never destroys history — your next share becomes a new
+  version on top.
+- **Visual conflict resolution** — when you and a teammate changed the same
+  block or item, MapGit draws it in the world: **green wireframe = yours**,
+  **red ghost = theirs**. Click *go to it* to fly the camera there, then choose
+  per conflict: **Keep mine / Take theirs / Keep both / Remove**. Resolve, apply,
+  done — a merge version lands in the timeline for everyone.
+- **Real GitHub repositories under the hood** — each map is a genuine git repo
+  (`map.Map.Gbx` + `manifest.json` per version), cloneable by power users, but
+  mappers never have to touch it.
+
+## Install
+
+1. Install [Openplanet Next](https://openplanet.dev) and [Editor++](https://github.com/XertroV/openplanet-editorplus)
+   (MapGit depends on it for editor operations and 3D drawing).
+2. Copy (or junction) `plugin/tm-mapgit` into `OpenplanetNext/Plugins/`.
+3. Start the game and open the map editor. MapGit appears in the menu bar.
+
+## Getting started
+
+1. Open a map in the editor and open the MapGit window.
+2. If it says the map isn't being watched yet, click **Start tracking this map**.
+3. Click **Connect to GitHub** once (opens a browser, enter the shown code —
+   the login is stored on your PC and can be revoked at
+   github.com/settings/applications at any time).
+4. Edit your map. When you're happy, type a short note and hit **Share**.
+5. Teammates do the same on their machines: they **Update** to receive, edit,
+   **Share** to publish. When you both touched the same block, the visual
+   merge walks you through it.
+
+## Safety
+
+- Your map file on disk is only replaced by verified content: every merged or
+  restored version is rebuilt and **hash-checked against the expected result**
+  first. If anything doesn't match, MapGit puts your map back exactly as it was.
+- The map always keeps working as a normal file — versions are snapshots *of*
+  it, stored content-addressed in `Documents\Trackmania\MapGit\<map>\`.
+- Medal times: Trackmania clears them by design whenever you edit (unvalidation).
+  MapGit records that honestly in every version; it never fakes them back.
+- The GitHub token lives in the plugin's own storage folder
+  (`OpenplanetNext/PluginStorage/tm-mapgit/auth.json`). Openplanet has no
+  secret storage — the file is plaintext, but it is never written to the shared
+  settings file and never logged.
+
+## For power users: Developer tools
+
+Enable **Developer tools** in the plugin settings to reveal the full git-facing
+UI: version lines (branches), switching (checkout), raw upload/download
+(push/pull), manifest dumps, and the terminology switch that flips every label
+between plain language and git terms. The shared map is the `main` branch of
+the map's GitHub repository; everything is standard git underneath.
+
+## The C# engine (this repository's other half)
+
+The `src/` solution is MapGit's **reference implementation and conformance
+harness** — the spec the plugin's AngelScript ports are validated against:
+
+- `MapGit.Core` — manifest model, canonical JSON + hashing, keyed diff,
+  3-way merge, float-noise-tolerant fingerprints
+- `MapGit.Gbx` — .Map.Gbx ↔ manifest extraction (GBX.NET + GBX.NET.LZO),
+  fidelity probing, headless merge materializer
+- `MapGit.Repo` / `MapGit.Git` — repository model, content-addressed object
+  storage, verification invariants
+- `MapGit.Cli` — `manifest`, `diff`, `probe`, `crosscheck`, `embedded`,
+  `init/status/commit/log/branch/checkout/merge`
+
+```
+dotnet build MapGit.slnx          # note: use --no-incremental for full rebuilds
+dotnet test  MapGit.slnx          # 37/37: merge scenarios, repo flows, real maps
+```
+
+The plugin's manifest builder is validated against the engine on real maps
+(5,603-block conformance: every block, item and metadata field matched).
+TM2020 maps use LZO compression, so `GBX.NET.LZO` (GPLv3) is required by the
+engine — **the C# solution ships GPLv3**; the Openplanet plugin is a separate
+work (MIT) and does not link it.
+
+## Repository layout
+
+```
+plugin/tm-mapgit/        the Openplanet plugin (the product)
+plugin/tm-mapgit-spikes/ the verification spike plugin (API proofs, kept as reference)
+src/                     the C# reference engine + conformance harness + CLI
+docs/                    phase reports and progress notes
+```
 
 ## Status
 
-**Phase 0 complete (verified in-game). Phase 1 engine side functional (37/37 tests).**
-
-- Manifest extraction is deterministic; **GBX.NET parse → save → reparse preserves the
-  canonical manifest on all tested real maps** (incl. a 21k-block/1.6k-item collab map).
-- **In-game ↔ engine data agreement proven by crosscheck**: every file block/item matches
-  the editor's live objects exactly; full baked/free/grass-double-reference ledger
-  reconciles.
-- Save-volatility mapped and handled: map uid regenerates every save (excluded — repo
-  identity is MapGit's own id); embedded item bytes churn every save (semantic
-  fingerprints — two real saves of the same map hash identically now); blocks, items and
-  metadata are fully save-stable.
-- **Full repository flows proven on a real map**: init → edit → commit → branch →
-  diverge → merge produces a manifest-verified merged map file with a two-parent commit;
-  conflicting merges report typed conflicts and preserve the work file; volatile-only
-  saves are skipped as no-ops.
-- TM2020 maps use **LZO** body compression → `GBX.NET.LZO` (GPLv3) is required.
-  **Licensing consequence: the engine must ship GPLv3** (the Openplanet plugin is a
-  separate work communicating over JSON and is not affected).
-
-Next up: tray service + the real `tm-mapgit` Openplanet panel (status/commit/pull/push),
-live merge apply with in-editor conflict markers. See `docs/phase-1-progress.md`.
+In active development (Phases A–C verified in-game: extraction, commits,
+version lines, GitHub sync incl. disaster recovery; merge + visual conflicts
+landing now). See `docs/phase-1-progress.md` for the detailed history.
 
 ## Conventions
 
-- **Plugin metadata (all Openplanet plugins in this repo, including the eventual `tm-mapgit` release plugin):** `author = "its_numpty"`, `category = "Map Editor"`.
-- The C# solution remains the conformance lab: AngelScript ports must match the C# test suite semantics.
-
-## Build & test
-
-```
-dotnet build MapGit.slnx
-dotnet test MapGit.slnx
-```
-
-Tests auto-discover real maps in `fixtures/maps/` (git-ignored local files) and
-silently skip if none are present.
-
-## CLI quick start
-
-```
-dotnet run --project src/MapGit.Cli -- manifest path\to\map.Map.Gbx
-dotnet run --project src/MapGit.Cli -- diff base.Map.Gbx other.Map.Gbx
-dotnet run --project src/MapGit.Cli -- probe path\to\map.Map.Gbx
-dotnet run --project src/MapGit.Cli -- crosscheck map.Map.Gbx spike-dump.csv
-```
-
-`crosscheck` compares an in-game spike dump (see `plugin/tm-mapgit-spikes`) against the
-engine's manifest of the saved file — validating that both sides agree on block/item
-names, coordinates and ghost flags.
-
-## Architecture (short version)
-
-Commit = full map snapshot (content-addressed) + canonical manifest (deterministic
-extraction). Merge = 3-way on manifests (per-position keying). Materialization prefers
-**the game's own serializer**: the plugin applies merge operations to the live map and
-the user saves; engine-side GBX writing is a headless fallback. Sync = real git
-repositories under the hood (GitHub/GitLab), driven by the engine — mappers never touch
-git. See the plan discussion and `docs/phase-0-report.md` for details.
+- Plugin metadata: `author = "its_numpty"`, `category = "Map Editor"`.
+- The C# engine remains the spec: AngelScript ports must match its test suite.

@@ -422,8 +422,8 @@ void MG_ShareWork() {
 
         // upload to the shared map (creates the remote on first share)
         g_mgRepoBusy = false;
-        if (S_GHToken.Length == 0) {
-            g_mgRepoStatusText = "not logged into GitHub — use the GitHub tab once to link your account";
+        if (g_ghToken.Length == 0) {
+            g_mgRepoStatusText = "connect to GitHub below to share with your team";
             MG_Log("share: " + g_mgRepoStatusText);
             return;
         }
