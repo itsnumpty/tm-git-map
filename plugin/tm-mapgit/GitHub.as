@@ -179,6 +179,16 @@ Json::Value@ GH_Api(const string&in method, const string&in url, const string&in
 
     g_ghLastCode = req.ResponseCode();
     if (req.Error() != "" || (g_ghLastCode != 200 && g_ghLastCode != 201)) {
+        if (g_ghLastCode == 401) {
+            // the stored token is dead (revoked/expired) — clear it so the panel
+            // offers reconnection and we stop retrying with it
+            MG_Log("GitHub: login rejected (401 Bad credentials) — token cleared; reconnect from the panel");
+            UI::ShowNotification("MapGit", "GitHub login expired — please reconnect from the MapGit panel.");
+            g_ghToken = "";
+            g_ghLogin = "";
+            GH_SaveToken();
+            g_ghStatus = "login expired — reconnect";
+        }
         MG_Log("GitHub: " + method + " " + url + " -> HTTP " + g_ghLastCode + " " + req.Error() +
                " body: " + req.String().SubStr(0, 300));
         return null;
