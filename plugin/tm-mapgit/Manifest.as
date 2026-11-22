@@ -22,6 +22,10 @@ class MGBlock {
     vec3 freePos;
     vec3 freeRot;
     bool hasSkin;
+    bool hasSkinFile;
+    bool hasSkinUrl;
+    string skinFile;
+    string skinUrl;
     bool hasWaypointProps;
     string contentJson; // full serialization (total-sort tiebreaker, Phase 0 finding F15)
 
@@ -65,12 +69,16 @@ class MGMapInfo {
     int goldTimeMs;
     int silverTimeMs;
     int bronzeTimeMs;
+    int authorScore;  // -1 = null (JSON null)
+    int cost;
+    string playMode;  // "" = not extractable in-game
     int nbLaps;
     bool isLapRace;
     int sizeX;
     int sizeY;
     int sizeZ;
     bool createdWithSimpleEditor;
+    bool hasGhostBlocks;
 }
 
 class MGManifest {
@@ -136,6 +144,19 @@ MGBlock MG_ToBlock(CGameCtnBlock@ b) {
     r.hasSkin = b.Skin !is null;
     r.hasWaypointProps = b.WaypointSpecialProperty !is null;
 
+    // Block skins ARE extractable in-game: CGameCtnBlockSkin.PackDesc is a
+    // CSystemPackDesc with FileName (wstring) and Url (string).
+    r.hasSkinFile = false;
+    r.hasSkinUrl = false;
+    r.skinFile = "";
+    r.skinUrl = "";
+    if (b.Skin !is null && b.Skin.PackDesc !is null) {
+        r.skinFile = b.Skin.PackDesc.FileName; // wstring -> string
+        r.skinUrl = b.Skin.PackDesc.Url;
+        r.hasSkinFile = r.skinFile.Length > 0;
+        r.hasSkinUrl = r.skinUrl.Length > 0;
+    }
+
     Editor::BlockSpec@ spec = Editor::MakeBlockSpec(b);
     if (spec !is null && spec.isFree) {
         r.isFree = true;
@@ -182,21 +203,32 @@ MGMapInfo@ MG_ExtractMapInfo(CGameCtnChallenge@ map) {
     mi.mapType = map.MapInfo.MapType;
     mi.mapStyle = map.MapInfo.MapStyle;
     mi.createdWithSimpleEditor = map.MapInfo.CreatedWithSimpleEditor;
+    // ChallengeParameters (holds times/scores when the challenge header doesn't)
+    CGameCtnChallengeParameters@ cp = map.ChallengeParameters;
+    // authorScore: from ChallengeParameters when present
+    mi.authorScore = -1; // -1 = null in JSON
+    if (cp !is null) {
+        mi.authorScore = int(cp.AuthorScore);
+    }
+    // cost: the C# header Cost corresponds to ChallengeInfo's CopperPrice
+    mi.cost = map.MapInfo.CopperPrice;
+    // playMode: file-format only (GBX.NET PlayMode enum, not on any in-game nod)
+    mi.playMode = "";
+    // hasGhostBlocks: no header flag in-game; compute from content
+    mi.hasGhostBlocks = false;
+    for (uint i = 0; i < map.Blocks.Length; i++) {
+        if (map.Blocks[i].IsGhostBlock()) { mi.hasGhostBlocks = true; break; }
+    }
     mi.authorTimeMs = map.TMObjective_AuthorTime;
     mi.goldTimeMs = map.TMObjective_GoldTime;
     mi.silverTimeMs = map.TMObjective_SilverTime;
     mi.bronzeTimeMs = map.TMObjective_BronzeTime;
     // header fields can be empty while ChallengeParameters holds the values
-    CGameCtnChallengeParameters@ cp = map.ChallengeParameters;
     if (cp !is null) {
         if (mi.authorTimeMs < 0) mi.authorTimeMs = int(cp.AuthorTime);
         if (mi.goldTimeMs < 0) mi.goldTimeMs = int(cp.GoldTime);
         if (mi.silverTimeMs < 0) mi.silverTimeMs = int(cp.SilverTime);
         if (mi.bronzeTimeMs < 0) mi.bronzeTimeMs = int(cp.BronzeTime);
-    }
-    if (map.Collection !is null) {
-        MG_Log("mapInfo diag: collection='" + mi.collection + "' decoration='" + mi.decoration +
-               "' terrainHeightOffset=" + map.Collection.TerrainHeightOffset);
     }
     mi.nbLaps = map.TMObjective_NbLaps;
     mi.isLapRace = map.TMObjective_IsLapRace;
@@ -214,7 +246,7 @@ MGManifest@ MG_BuildManifest(CGameCtnChallenge@ map) {
 
     // Canonical block set (Phase A finding): map.Blocks (2845) + BakedBlocks minus
     // nod-identity dupes (grass double-references — same nods in both lists) = the
-    // engine's flat file list (5603). Dedup by handle identity, never by fields.
+    // engine's flat file list. Dedup by handle identity, never by fields.
     for (uint i = 0; i < map.Blocks.Length; i++) {
         m.blocks.InsertLast(MG_ToBlock(map.Blocks[i]));
     }
@@ -239,7 +271,7 @@ MGManifest@ MG_BuildManifest(CGameCtnChallenge@ map) {
     MG_SuffixBlocks(m.blocks);
     MG_SuffixItems(m.items);
 
-    m.embeddedEntryCount = 0; // v1 TODO: Fids MemoryTemp/CurrentMap_EmbeddedFiles + TolerantHash
+    m.embeddedEntryCount = 0; // embedded entries: full TolerantHash port is future work (see docs)
     return m;
 }
 
@@ -297,7 +329,7 @@ string MG_BlockJson(const MGBlock&in b) {
         ",\"isFree\":" + (b.isFree ? "true" : "false") +
         ",\"isGhost\":" + (b.isGhost ? "true" : "false") +
         ",\"isGround\":" + (b.isGround ? "true" : "false") +
-        ",\"isClip\":false,\"isPillar\":false" + // v1 TODO: in-game members unconfirmed
+        ",\"isClip\":false,\"isPillar\":false" + // file-format-only flags (GBX.NET bits 13/14, no in-game members)
         ",\"coord\":{\"x\":" + b.cx + ",\"y\":" + b.cy + ",\"z\":" + b.cz + "}" +
         ",\"direction\":" + b.direction +
         ",\"variant\":" + b.variant +
@@ -307,9 +339,10 @@ string MG_BlockJson(const MGBlock&in b) {
         ",\"freePosition\":" + (b.hasFree ? MG_Vec3Json(b.freePos) : "null") +
         ",\"freeRotation\":" + (b.hasFree ? MG_Vec3Json(b.freeRot) : "null") +
         ",\"hasSkin\":" + (b.hasSkin ? "true" : "false") +
-        ",\"skinFile\":null,\"skinUrl\":null" + // v1 TODO: in-game skin PackDesc unconfirmed
+        ",\"skinFile\":" + (b.hasSkinFile ? MG_JsonStr(b.skinFile) : "null") +
+        ",\"skinUrl\":" + (b.hasSkinUrl ? MG_JsonStr(b.skinUrl) : "null") +
         ",\"hasWaypointProps\":" + (b.hasWaypointProps ? "true" : "false") +
-        ",\"decalId\":null,\"hasMacroblockRef\":false}"; // v1 TODO
+        ",\"decalId\":null,\"hasMacroblockRef\":false}"; // file-format-only (no in-game members)
 }
 
 string MG_ItemJson(const MGItem&in i) {
@@ -318,10 +351,10 @@ string MG_ItemJson(const MGItem&in i) {
         ",\"position\":" + MG_Vec3Json(i.position) +
         ",\"rotation\":" + MG_Vec3Json(i.rotation) +
         ",\"scale\":" + MG_F(i.scale) +
-        ",\"pivot\":null" + // v1 TODO: in-game PivotPosition unconfirmed
+        ",\"pivot\":null" + // file-format-only (no PivotPosition on in-game CGameCtnAnchoredObject)
         ",\"color\":\"" + i.color + "\"" +
         ",\"lightmapQuality\":\"" + i.lmQual + "\"" +
-        ",\"hasSkin\":false,\"skinFile\":null,\"skinUrl\":null" + // v1 TODO: no PackDesc in-game
+        ",\"hasSkin\":false,\"skinFile\":null,\"skinUrl\":null" + // no PackDesc on in-game CGameCtnAnchoredObject
         ",\"hasWaypointProps\":" + (i.hasWaypointProps ? "true" : "false") + "}";
 }
 
@@ -342,14 +375,14 @@ string MG_MapInfoJson(MGMapInfo@ mi) {
         ",\"goldTimeMs\":" + MG_TimeJson(mi.goldTimeMs) +
         ",\"silverTimeMs\":" + MG_TimeJson(mi.silverTimeMs) +
         ",\"bronzeTimeMs\":" + MG_TimeJson(mi.bronzeTimeMs) +
-        ",\"authorScore\":null" + // v1 TODO
+        ",\"authorScore\":" + (mi.authorScore < 0 ? "null" : "" + mi.authorScore) +
         ",\"nbLaps\":" + mi.nbLaps +
         ",\"isLapRace\":" + (mi.isLapRace ? "true" : "false") +
-        ",\"playMode\":\"\"" + // v1 TODO
-        ",\"cost\":0" + // v1 TODO
+        ",\"playMode\":" + MG_JsonStr(mi.playMode) + // "" until the GBX PlayMode enum surfaces in-game
+        ",\"cost\":" + mi.cost +
         ",\"size\":{\"x\":" + mi.sizeX + ",\"y\":" + mi.sizeY + ",\"z\":" + mi.sizeZ + "}" +
         ",\"createdWithSimpleEditor\":" + (mi.createdWithSimpleEditor ? "true" : "false") +
-        ",\"hasGhostBlocks\":false}"; // v1 TODO
+        ",\"hasGhostBlocks\":" + (mi.hasGhostBlocks ? "true" : "false") + "}";
 }
 
 void MG_WriteManifest(MGManifest@ m, const string&in path) {
@@ -440,9 +473,8 @@ void MG_BuildAndWrite() {
     MG_WriteManifest(m, path);
     g_mgLastSummary = "blocks: " + m.blocks.Length + " (baked dupes skipped: " + g_mgDupesSkipped + ")\n" +
         "items: " + m.items.Length + "\n" +
-        "embedded: " + m.embeddedEntryCount + " entries (TODO)\n" +
+        "embedded: " + m.embeddedEntryCount + " entries (TolerantHash port pending)\n" +
         "written: " + path;
     MG_Log("blocks " + m.blocks.Length + " (dupes skipped " + g_mgDupesSkipped + "), items " +
         m.items.Length + " -> " + path);
-    MG_Log("expected (Ninconpoop TEST): 5603 blocks (2845 + 2758 baked, 2304 dupes), 28 items");
 }

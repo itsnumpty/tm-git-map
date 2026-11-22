@@ -475,7 +475,7 @@ void GH_BindExistingCoro() {
         g_ghRepo = parts[parts.Length - 1];
     }
     if (g_ghOwner.Length == 0 || g_ghRepo.Length == 0 || g_ghOwner == "github.com") {
-        MG_Log("push: enter the repository as owner/name (e.g. itsnumpty/Ninconpoop-TEST)");
+        MG_Log("push: enter the repository as owner/name (e.g. yourname/your-map)");
         g_ghBusy = false;
         return;
     }

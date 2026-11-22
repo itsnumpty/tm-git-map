@@ -71,12 +71,7 @@ string MG_Sha256File(const string&in path) {
 
 void MG_Sha256SelfTest() {
     MG_Log("sha256(\"abc\") = " + Crypto::Sha256("abc") + "  want ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-    string refPath = "C:/Users/taneo/AppData/Local/Temp/opencode/engine-manifest-test.json";
-    if (IO::FileExists(refPath)) {
-        MG_Log("sha256(engine-manifest-test.json) = " + MG_Sha256File(refPath) + "  (compare with Get-FileHash)");
-    } else {
-        MG_Log("sha256 self-test: reference file missing: " + refPath);
-    }
+    MG_Log("sha256(\"\") = " + Crypto::Sha256("") + "  want e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 }
 
 string MG_RepoIdFor(const string&in mapFileRaw) {
@@ -94,7 +89,7 @@ string MG_RepoIdFor(const string&in mapFileRaw) {
     return stem + "-" + Crypto::Sha256(mapFile).SubStr(0, 8);
 }
 
-// The open map's file path, normalized to forward slashes ("My Maps/Ninconpoop TEST.Map.Gbx").
+// The open map's file path, normalized to forward slashes.
 string MG_MapFileOf(CGameCtnChallenge@ map) {
     string f = map.MapInfo.FileName; // wstring -> string (no Replace on wstring)
     return f.Replace("\\", "/");
@@ -472,22 +467,22 @@ bool MG_IsAncestor(const string&in repoDir, const string&in maybeAncestor, const
     return false;
 }
 
-void MG_NormalizeToMainLine(const string&in repoDir, string&io branch) {
-    if (branch == "main") return;
-    string oldBranch = branch;
-    string tip = MG_TipSha(repoDir, branch);
+// Returns the branch to use (adopts the current line as 'main' when safe).
+string MG_NormalizeToMainLine(const string&in repoDir, const string&in currentBranch) {
+    if (currentBranch == "main") return currentBranch;
+    string tip = MG_TipSha(repoDir, currentBranch);
     string mainTip = MG_TipSha(repoDir, "main");
-    if (tip.Length == 0) return; // nothing on the current line — leave as is
+    if (tip.Length == 0) return currentBranch; // nothing on the current line — leave as is
     bool adopt = (mainTip.Length == 0) || MG_IsAncestor(repoDir, mainTip, tip);
     if (!adopt) {
-        MG_Log("NOTE: local '" + oldBranch + "' and 'main' have separate histories — "
+        MG_Log("NOTE: local '" + currentBranch + "' and 'main' have separate histories — "
                "sort them out with the Developer tools");
-        return;
+        return currentBranch;
     }
     MG_WriteTextFile(repoDir + "/refs/heads/main", tip);
     MG_WriteTextFile(repoDir + "/HEAD", "ref: refs/heads/main");
-    branch = "main";
-    MG_Log("adopted version line '" + oldBranch + "' as the shared 'main' line (" + MG_Short(tip) + ")");
+    MG_Log("adopted version line '" + currentBranch + "' as the shared 'main' line (" + MG_Short(tip) + ")");
+    return "main";
 }
 void MG_AutoLoadRepoState(CGameCtnChallenge@ map) {
     string mapFile = MG_MapFileOf(map);
@@ -497,8 +492,8 @@ void MG_AutoLoadRepoState(CGameCtnChallenge@ map) {
     g_mgRepoId = repoId;
     string repoDir = MG_ReposRoot() + "/" + repoId;
     if (IO::FolderExists(repoDir)) {
-        g_mgRepoBranch = MG_CurrentBranch(repoDir);
-        MG_NormalizeToMainLine(repoDir, g_mgRepoBranch); // one-shared-map: the line IS main
+        string currentBranch = MG_CurrentBranch(repoDir);
+        g_mgRepoBranch = MG_NormalizeToMainLine(repoDir, currentBranch);
         g_mgRepoTip = MG_TipSha(repoDir, g_mgRepoBranch);
         MG_LoadBranches(repoDir);
         MG_LoadTimeline(repoDir, g_mgRepoTip);
