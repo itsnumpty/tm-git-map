@@ -145,12 +145,16 @@ void MG_StampWork() {
 
 // ------------------------- restore (working map <- version, history kept) -------------------------
 
+string g_mgRestoreTarget = "";
+
 void MG_RestoreCoro(string commitSha) {
     if (g_mgRepoBusy) return;
-    startnew(MG_RestoreWork(commitSha));
+    g_mgRestoreTarget = commitSha;
+    startnew(MG_RestoreWork);
 }
 
-void MG_RestoreWork(string commitSha) {
+void MG_RestoreWork() {
+    string commitSha = g_mgRestoreTarget;
     g_mgRepoBusy = true;
     CGameCtnChallenge@ map = GetMap();
     if (map is null) { MG_Log("restore: no map open"); g_mgRepoBusy = false; return; }
