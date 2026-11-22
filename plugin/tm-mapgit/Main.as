@@ -54,13 +54,17 @@ void RenderStatusTab() {
         UI::Text("Open the map editor to use MapGit.");
         return;
     }
+    MG_AutoLoadRepoState(map); // instant load + automatic dirty check (once per map per session)
     string file = map.MapInfo.FileName;
     UI::Text("Map    : " + map.MapName);
     UI::Text("File   : " + file);
     UI::Text("Blocks : " + map.Blocks.Length + " + " + map.BakedBlocks.Length + " baked");
     UI::Text("Items  : " + map.AnchoredObjects.Length);
     UI::Separator();
-    UI::TextDisabled("Repository: not initialized yet (coming in Phase B)");
+    UI::Text(T("Version line", "Branch") + " : " + g_mgRepoBranch +
+             "    " + T("latest version", "HEAD") + ": " + (g_mgRepoTip.Length > 0 ? MG_Short(g_mgRepoTip) : "(none)"));
+    UI::Text("State  : " + g_mgRepoStatusText);
+    if (g_mgRepoBusy) UI::TextDisabled("  (working...)");
 }
 
 // ------------------------- helpers -------------------------

@@ -179,12 +179,29 @@ string MG_KindName(int kind) {
 
 // ------------------------- conflict world positions -------------------------
 
+// Vertical offset between coord-space (cy*8) and the camera/render space.
+// Default = the Stadium2020 7-cell base; calibrated at merge time against a
+// live block's MakeBlockSpec position (the proven-bound exact source).
+float g_mgWorldBaseY = 56.0;
+
+void MG_CalibrateWorldSpace(CGameCtnChallenge@ map) {
+    for (uint i = 0; i < map.Blocks.Length; i++) {
+        CGameCtnBlock@ b = map.Blocks[i];
+        if (int(b.Coord.x) < 0) continue; // grid blocks only
+        Editor::BlockSpec@ spec = Editor::MakeBlockSpec(b);
+        if (spec is null) continue;
+        g_mgWorldBaseY = spec.pos.y - (b.Coord.y * 8.0);
+        MG_Log("merge: world-space calibration baseY=" + g_mgWorldBaseY +
+               " (from live block '" + b.DescId.GetName() + "' at cell y=" + b.Coord.y + ")");
+        return;
+    }
+}
+
 vec3 MG_BlockWorldPos(const MGBlock&in b) {
-    if (b.isFree) return b.freePos + vec3(0, 56, 0); // back to E++ memory space
-    // E++ Math.as formula: pos = (coord.x*32, coord.y*8 - baseOffset, coord.z*32)
-    // with baseOffset = -extendsBelowZero = -56 for Stadium2020 (same 7-cell constant
-    // as the free-position offset; verified against E++'s own CoordToPos definition).
-    return vec3(b.cx * 32.0 + 16.0, b.cy * 8.0 + 56.0 + 4.0, b.cz * 32.0 + 16.0);
+    if (b.isFree) return b.freePos + vec3(0, g_mgWorldBaseY, 0); // memory space
+    // E++ Math.as formula with the calibrated base offset:
+    // pos = (coord.x*32, coord.y*8 + baseY, coord.z*32), + half cell = center
+    return vec3(b.cx * 32.0 + 16.0, b.cy * 8.0 + g_mgWorldBaseY + 4.0, b.cz * 32.0 + 16.0);
 }
 
 vec3 MG_ItemWorldPos(const MGItem&in i) {
@@ -860,7 +877,7 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
             }
             Editor::BlockSpec@ spec;
             if (e.isFree) {
-                vec3 pos = e.freePos + vec3(0, 56, 0);        // back to E++ memory space
+                vec3 pos = e.freePos + vec3(0, g_mgWorldBaseY, 0);        // back to E++ memory space
                 vec3 pyr = vec3(e.freeRot.y, e.freeRot.x, e.freeRot.z); // back to (pitch, yaw, roll)
                 @spec = Editor::MakeBlockSpec(info, pos, pyr);
                 spec.isGhost = e.isGhost;
@@ -986,6 +1003,7 @@ void MG_MergeWork() {
 
 void MG_MergeWorkInner() {
     g_mgMergeStatus = "combining...";
+    MG_CalibrateWorldSpace(GetMap());
     CGameCtnChallenge@ map = GetMap();
     if (map is null) { MG_Log("merge: no map open"); g_mgRepoBusy = false; g_mgMergeStatus = "no map"; return; }
     if (g_mgMergeSel < 0 || g_mgMergeSel >= int(g_mgBranches.Length)) {

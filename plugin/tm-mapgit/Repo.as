@@ -453,7 +453,8 @@ void MG_CheckoutCoro() {
 
 string g_mgAutoRepoKey = ""; // last repo the tab auto-loaded (fast, no manifest build)
 
-// Instant state load when the tab opens on a map it hasn't seen yet (per session).
+// Instant state load when the tab opens on a map it hasn't seen yet (per session),
+// then kicks the full status refresh (dirty check) automatically.
 // No EnsureRepo here: opening a random map must not create a repo directory.
 void MG_AutoLoadRepoState(CGameCtnChallenge@ map) {
     string mapFile = MG_MapFileOf(map);
@@ -469,6 +470,8 @@ void MG_AutoLoadRepoState(CGameCtnChallenge@ map) {
         for (uint i = 0; i < g_mgBranches.Length; i++) {
             if (g_mgBranches[i] == g_mgRepoBranch) g_mgSelBranch = int(i);
         }
+        // automatic dirty check (runs in a coroutine; the UI stays responsive)
+        if (!g_mgRepoBusy) startnew(MG_RefreshStatusCoro);
     } else {
         g_mgRepoBranch = "main";
         g_mgRepoTip = "";
