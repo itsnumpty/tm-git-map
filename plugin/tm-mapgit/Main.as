@@ -26,26 +26,33 @@ void Render() {
     MG_DrawConflictMarkersFrame(); // 3D conflict wireframes (draws even with the window closed)
     if (!g_windowVisible) return;
     UI::SetNextWindowSize(600, 520, UI::Cond::FirstUseEver);
-    UI::Begin(Icons::CodeBranch + " MapGit", g_windowVisible);
-    UI::BeginTabBar("mapgit-tabs");
-    if (UI::BeginTabItem("Status")) {
-        RenderStatusTab();
-        UI::EndTabItem();
+    if (S_DevTools) {
+        UI::Begin(Icons::CodeBranch + " MapGit", g_windowVisible);
+        UI::BeginTabBar("mapgit-tabs");
+        if (UI::BeginTabItem("Status")) {
+            RenderStatusTab();
+            UI::EndTabItem();
+        }
+        if (UI::BeginTabItem("Manifest")) {
+            RenderManifestTab();
+            UI::EndTabItem();
+        }
+        if (UI::BeginTabItem(T("Versions", "Repository"))) {
+            RenderRepoTab();
+            UI::EndTabItem();
+        }
+        if (UI::BeginTabItem("GitHub")) {
+            RenderGitHubTab();
+            UI::EndTabItem();
+        }
+        UI::EndTabBar();
+        UI::End();
+    } else {
+        // everyday UI: one map, one panel, no git concepts
+        UI::Begin(Icons::CodeBranch + " MapGit", g_windowVisible);
+        RenderMainPanel();
+        UI::End();
     }
-    if (UI::BeginTabItem("Manifest")) {
-        RenderManifestTab();
-        UI::EndTabItem();
-    }
-    if (UI::BeginTabItem(T("Versions", "Repository"))) {
-        RenderRepoTab();
-        UI::EndTabItem();
-    }
-    if (UI::BeginTabItem("GitHub")) {
-        RenderGitHubTab();
-        UI::EndTabItem();
-    }
-    UI::EndTabBar();
-    UI::End();
 }
 
 void RenderStatusTab() {

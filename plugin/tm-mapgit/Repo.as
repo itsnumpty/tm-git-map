@@ -209,6 +209,8 @@ void MG_RefreshStatusCoro() {
         }
     }
     MG_Log("status: branch=" + g_mgRepoBranch + " tip=" + MG_Short(g_mgRepoTip) + " manifest=" + MG_Short(msha));
+    MG_LoadTimeline(repoDir, g_mgRepoTip); // keep the panel timeline fresh
+    MG_LoadStamps(repoDir);
     g_mgRepoBusy = false;
 }
 
@@ -303,6 +305,7 @@ void MG_CommitCoro() {
     g_mgRepoBranch = branch;
     g_mgRepoStatusText = "clean (committed " + MG_Short(csha) + ")";
     MG_LoadLog(repoDir, csha);
+    MG_LoadTimeline(repoDir, csha); // panel timeline
     MG_Log("commit: " + csha + "  \"" + msg + "\"");
     g_mgRepoBusy = false;
 }
@@ -467,6 +470,8 @@ void MG_AutoLoadRepoState(CGameCtnChallenge@ map) {
         g_mgRepoBranch = MG_CurrentBranch(repoDir);
         g_mgRepoTip = MG_TipSha(repoDir, g_mgRepoBranch);
         MG_LoadBranches(repoDir);
+        MG_LoadTimeline(repoDir, g_mgRepoTip);
+        MG_LoadStamps(repoDir);
         for (uint i = 0; i < g_mgBranches.Length; i++) {
             if (g_mgBranches[i] == g_mgRepoBranch) g_mgSelBranch = int(i);
         }
