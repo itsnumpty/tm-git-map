@@ -193,7 +193,8 @@ vec3 MG_ItemWorldPos(const MGItem&in i) {
 
 void MG_JumpCamera(const vec3&in target) {
     try {
-        Editor::SetCamAnimationGoTo(Editor::DirToLookUvFromCamera(target), target + vec3(0, 64, 128), 192.0);
+        bool ok = Editor::SetCamAnimationGoTo(Editor::DirToLookUvFromCamera(target), target + vec3(0, 64, 128), 192.0);
+        MG_Log("merge: go -> camera to " + target.ToString() + " -> " + (ok ? "true" : "false"));
     } catch {
         MG_Log("merge: camera jump failed: " + getExceptionInfo());
     }
@@ -201,6 +202,8 @@ void MG_JumpCamera(const vec3&in target) {
 
 // Draws unresolved conflicts as 3D wireframes every frame (called from Render()):
 // green box = ours (in place), red ghost box = theirs. Resolved ones vanish.
+bool g_mgMarkersLogged = false;
+
 void MG_DrawConflictMarkersFrame() {
     if (!g_mgMergeActive || g_mgConflicts.Length == 0) return;
 
@@ -209,12 +212,14 @@ void MG_DrawConflictMarkersFrame() {
     theirsDI.ResetLines();
     theirsDI.RequestLineColor(vec3(1, 0.25, 0.25)); // red — theirs (ghost)
     bool anyTheirs = false;
+    vec3 firstTheirsPos = vec3();
 
     auto oursDI = Editor::DrawLinesAndQuads::GetOrCreateDrawInstance("mapgit-merge-ours");
     if (oursDI is null) return;
     oursDI.ResetLines();
     oursDI.RequestLineColor(vec3(0.3, 1, 0.4)); // green — ours (in place)
     bool anyOurs = false;
+    vec3 firstOursPos = vec3();
 
     vec3 h = vec3(16, 4, 16); // half extents of a 32x8x32 block cell
 
@@ -223,6 +228,7 @@ void MG_DrawConflictMarkersFrame() {
         if (c.resolution != 0) continue; // resolved — no marker
 
         if (c.hasTheirsPos) {
+            if (!anyTheirs) firstTheirsPos = c.theirsPos;
             vec3 a = c.theirsPos - h;
             vec3 b = c.theirsPos + h;
             theirsDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(b.x, a.y, a.z));
@@ -240,6 +246,7 @@ void MG_DrawConflictMarkersFrame() {
             anyTheirs = true;
         }
         if (c.hasOursPos) {
+            if (!anyOurs) firstOursPos = c.oursPos;
             vec3 a = c.oursPos - h;
             vec3 b = c.oursPos + h;
             oursDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(b.x, a.y, a.z));
@@ -259,6 +266,12 @@ void MG_DrawConflictMarkersFrame() {
     }
     if (anyTheirs) theirsDI.Draw();
     if (anyOurs) oursDI.Draw();
+    if (!g_mgMarkersLogged && g_mgConflicts.Length > 0) {
+        g_mgMarkersLogged = true;
+        MG_Log("conflict markers frame: " + g_mgConflicts.Length + " conflicts; drawing theirs=" +
+               (anyTheirs ? "yes at " + firstTheirsPos.ToString() : "NO (no positions)") +
+               "; ours=" + (anyOurs ? "yes at " + firstOursPos.ToString() : "NO (no positions)"));
+    }
 }
 
 // ------------------------- merge state -------------------------
@@ -922,6 +935,7 @@ void MG_ClearMergeState() {
     @g_mgMergedClean = null;
     @g_mgTheirsMapInfo = null;
     g_mgMergeStatus = "";
+    g_mgMarkersLogged = false;
 }
 
 bool MG_RestoreOursBlob(CGameCtnChallenge@ map, const string&in repoDir, const string&in oursTip) {
