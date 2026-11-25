@@ -1,4 +1,4 @@
-// Join.as — "Join a shared map": a teammate picks a MapGit repository they were invited to
+// Join.as — "Join a shared map": a collaborator picks a MapGit repository they were invited to
 // (or pastes a link), and MapGit downloads its history into a new local repo, writes the
 // latest version into My Maps, links it to GitHub, and opens it in the editor.
 

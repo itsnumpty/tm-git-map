@@ -22,7 +22,7 @@ public sealed record RoundTripReport
 }
 
 /// <summary>
-/// Phase 0 fidelity probe: parse a map with GBX.NET, re-save it with GBX.NET, reparse,
+/// Round-trip fidelity probe: parse a map with GBX.NET, re-save it with GBX.NET, reparse,
 /// and measure whether the canonical manifest survives the round trip (structural
 /// fidelity) even if raw bytes change (recompression etc. is fine).
 /// </summary>

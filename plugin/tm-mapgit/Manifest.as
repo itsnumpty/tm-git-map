@@ -1,6 +1,4 @@
-// Manifest.as — ManifestBuilder v1: live map -> canonical manifest JSON (schema 0.1 subset).
-// Port of MapGit.Core MapFile.ExtractManifest + ManifestCanonicalizer + ManifestKeys.
-// Verified API basis: docs/phase-a-report.md.
+// Manifest.as — extracts a canonical JSON manifest from the live map.
 
 // ------------------------- data model -------------------------
 
@@ -27,7 +25,7 @@ class MGBlock {
     string skinFile;
     string skinUrl;
     bool hasWaypointProps;
-    string contentJson; // full serialization (total-sort tiebreaker, Phase 0 finding F15)
+    string contentJson; // full serialization (total-sort tiebreaker for same-cell blocks)
 
     int opCmp(const MGBlock&in other) {
         if (key != other.key) return key < other.key ? -1 : 1;
@@ -100,7 +98,7 @@ class MGManifest {
     array<MGEmbeddedEntry> embeddedEntries;
 }
 
-// ------------------------- keys (port of ManifestKeys) -------------------------
+// ------------------------- keys -------------------------
 
 // Fixed-point rounding away from zero with exactly `d` decimals (F3/F2, invariant culture).
 // Zero is never negative ("0.00", not "-0.00") — file-saved floats carry -1e-7 noise where
@@ -146,8 +144,7 @@ MGBlock MG_ToBlock(CGameCtnBlock@ b) {
     r.cy = b.Coord.y;
     r.cz = b.Coord.z;
     r.direction = int(b.Direction);
-    // Variant mapping settled by probe round 1: the file's flags-based Variant/SubVariant
-    // (what GBX.NET and the manifest use) live in MobilIndex/MobilVariantIndex in-game.
+    // The file's flags-based Variant/SubVariant live in MobilIndex/MobilVariantIndex in-game.
     // BlockInfoVariantIndex reads 0 for baked blocks — do not use it.
     r.variant = b.MobilIndex;
     r.subVariant = b.MobilVariantIndex;
@@ -173,10 +170,9 @@ MGBlock MG_ToBlock(CGameCtnBlock@ b) {
     if (spec !is null && spec.isFree) {
         r.isFree = true;
         r.hasFree = true;
-        // E++ reads raw engine fields: in-memory free pos is +56 (Stadium2020 7-cell base
-        // offset) above the file's AbsolutePositionInMap, and spec.pyr is (pitch, yaw,
-        // roll) while the manifest wants (yaw, pitch, roll). Both verified empirically
-        // against the C# engine manifest (Phase B conformance round 1).
+        // In-memory free-block pos is +56 (Stadium2020 7-cell base offset) above
+        // the file's AbsolutePositionInMap, and spec.pyr is (pitch, yaw, roll)
+        // while the manifest stores (yaw, pitch, roll).
         r.freePos = spec.pos - vec3(0, 56, 0);
         r.freeRot = vec3(spec.pyr.y, spec.pyr.x, spec.pyr.z);
         r.key = "f:" + MG_Fmt(r.freePos, 3) + "|" + MG_Fmt(r.freeRot, 2) + (r.isGhost ? "|gh" : "");
@@ -256,9 +252,8 @@ MGManifest@ MG_BuildManifest(CGameCtnChallenge@ map) {
     MGManifest@ m = MGManifest();
     @m.mapInfo = MG_ExtractMapInfo(map);
 
-    // Canonical block set (Phase A finding): map.Blocks (2845) + BakedBlocks minus
-    // nod-identity dupes (grass double-references — same nods in both lists) = the
-    // engine's flat file list. Dedup by handle identity, never by fields.
+    // Canonical block set: map.Blocks + BakedBlocks minus nod-identity duplicates
+    // (some blocks appear in both lists). Dedup by handle identity, never by fields.
     for (uint i = 0; i < map.Blocks.Length; i++) {
         m.blocks.InsertLast(MG_ToBlock(map.Blocks[i]));
     }
@@ -378,8 +373,7 @@ void MG_EnsureTheirsEmbeddedAvailable(const string&in repoDir, const string&in t
     } catch {
         MG_Log("merge: ReloadItemsAsync unavailable or failed: " + getExceptionInfo());
     }
-    // Hint: custom items must be in the player's Items folder or already embedded in the live map.
-    // Full zip install from the theirs .gbx blob is not available in-plugin (no LZO unpacker).
+    // Custom item files from the repo are installed by Items.as before this reload.
 }
 
 void MG_SuffixBlocks(array<MGBlock>@ arr) {
@@ -412,7 +406,7 @@ void MG_SuffixItems(array<MGItem>@ arr) {
     }
 }
 
-// ------------------------- canonical JSON (C# CanonicalJson-compatible shape) -------------------------
+// ------------------------- canonical JSON -------------------------
 
 string MG_JsonStr(const string&in s) {
     string r = s;
@@ -423,7 +417,7 @@ string MG_JsonStr(const string&in s) {
 
 string MG_F(float v) {
     if (v == Math::Floor(v) && Math::Abs(v) < 9000000.0) return "" + int64(v);
-    return "" + v; // v1: structural comparison; byte-exact float formatting is a v2 item
+    return "" + v;
 }
 
 string MG_Vec3Json(const vec3&in v) {
@@ -516,45 +510,6 @@ void MG_WriteManifest(MGManifest@ m, const string&in path) {
     f.Close();
 }
 
-// ------------------------- variant probe -------------------------
-
-// Dumps every block's variant-related fields (manifest key joinable) so the engine
-// manifest can settle which in-game field carries the file's flags-based Variant
-// (baked blocks reset BlockInfoVariantIndex to 0 in memory — Phase B open question).
-void MG_VariantProbe() {
-    CGameCtnChallenge@ map = GetMap();
-    if (map is null) { MG_Log("no map open"); return; }
-    string path = IO::FromStorageFolder("variant-probe.csv");
-    IO::File f(path, IO::FileMode::Write);
-    f.WriteLine("source,key,name,variant,mobilVariant,mobilIx,isFree,isGhost,cx,cy,cz");
-    uint n = 0;
-    for (uint pass = 0; pass < 2; pass++) {
-        bool baked = pass == 1;
-        uint len = baked ? map.BakedBlocks.Length : map.Blocks.Length;
-        for (uint i = 0; i < len; i++) {
-            CGameCtnBlock@ b = baked ? map.BakedBlocks[i] : map.Blocks[i];
-            Editor::BlockSpec@ spec = Editor::MakeBlockSpec(b);
-            bool free = spec !is null && spec.isFree;
-            bool ghost = b.IsGhostBlock();
-            string k;
-            if (free) {
-                vec3 pos = spec.pos - vec3(0, 56, 0);
-                vec3 rot = vec3(spec.pyr.y, spec.pyr.x, spec.pyr.z);
-                k = "f:" + MG_Fmt(pos, 3) + "|" + MG_Fmt(rot, 2) + (ghost ? "|gh" : "");
-            } else {
-                k = "b:" + b.Coord.x + "," + b.Coord.y + "," + b.Coord.z + (ghost ? "#gh" : "");
-            }
-            f.WriteLine((baked ? "bk" : "b") + ",\"" + k + "\"," + b.DescId.GetName() +
-                "," + b.BlockInfoVariantIndex + "," + b.MobilVariantIndex + "," + b.MobilIndex +
-                "," + (free ? 1 : 0) + "," + (ghost ? 1 : 0) +
-                "," + b.Coord.x + "," + b.Coord.y + "," + b.Coord.z);
-            n++;
-        }
-    }
-    f.Close();
-    MG_Log("variant probe: " + n + " blocks -> " + path);
-}
-
 // ------------------------- UI -------------------------
 
 string g_mgLastSummary = "(manifest not built yet)";
@@ -565,28 +520,22 @@ void RenderManifestTab() {
         UI::Text("Open the map editor to use MapGit.");
         return;
     }
-    UI::Text("ManifestBuilder v1 — live map → canonical manifest (schema 0.1 subset)");
+    UI::Text("Live map → canonical manifest");
     if (UI::Button("Build manifest")) MG_BuildAndWrite();
-    UI::SameLine();
-    if (UI::Button("Variant probe (CSV)")) MG_VariantProbe();
     UI::Separator();
     UI::TextWrapped(g_mgLastSummary);
-    UI::Separator();
-    UI::TextDisabled("v1 gaps (structural compare only): isClip/isPillar/subVariant, skins, " +
-        "decals, macroblock refs, item pivot, most mapInfo fields, embedded entries. " +
-        "Byte-exact JSON + hash equality is a v2 item.");
 }
 
 void MG_BuildAndWrite() {
     CGameCtnChallenge@ map = GetMap();
     if (map is null) { MG_Log("no map open"); return; }
-    MG_Log("building manifest v1 from '" + map.MapName + "'...");
+    MG_Log("building manifest from '" + map.MapName + "'...");
     MGManifest@ m = MG_BuildManifest(map);
     string path = IO::FromStorageFolder("manifest-current.json");
     MG_WriteManifest(m, path);
     g_mgLastSummary = "blocks: " + m.blocks.Length + " (baked dupes skipped: " + g_mgDupesSkipped + ")\n" +
         "items: " + m.items.Length + "\n" +
-        "embedded: " + m.embeddedEntryCount + " entries (TolerantHash port pending)\n" +
+        "embedded: " + m.embeddedEntryCount + " entries\n" +
         "written: " + path;
     MG_Log("blocks " + m.blocks.Length + " (dupes skipped " + g_mgDupesSkipped + "), items " +
         m.items.Length + " -> " + path);

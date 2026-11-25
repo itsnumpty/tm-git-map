@@ -8,7 +8,7 @@ using MapGit.Repo;
 if (args.Length == 0 || args[0] is "--help" or "-h" or "help")
 {
     Console.WriteLine("""
-        mapgit � git-style version control for Trackmania maps (Phase 0 tooling)
+        mapgit � git-style version control for Trackmania maps
 
         Usage:
           mapgit manifest <file.Map.Gbx> [--out <manifest.json>]

@@ -20,8 +20,7 @@ public class TolerantHashTests
     [Fact]
     public void last_bit_float_noise_yields_same_fingerprint()
     {
-        // Actual observed churn from Ninconpoop's embedded item (F11): a run of floats
-        // whose bits change in the last bits on every save, e.g. 0x3ECFD8A2 vs 0x3ECFD8A8.
+        // Observed churn in an embedded item: a run of floats whose lowest bits drift on save.
         var a = TolerantHash.Fingerprint(Words(0x3ECFD8A2, 0xBF69F4EE, 0xDEADBEEF));
         var b = TolerantHash.Fingerprint(Words(0x3ECFD8A8, 0xBF69F4ED, 0xDEADBEEF));
         Assert.Equal(a, b);

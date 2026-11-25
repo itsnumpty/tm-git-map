@@ -7,8 +7,8 @@ public sealed record ManifestVec3(float X, float Y, float Z);
 public sealed record ManifestInt3(int X, int Y, int Z);
 
 /// <summary>Mergeable map-level metadata (field-level 3-way merge).
-/// NOTE: map uid is deliberately NOT here — the game regenerates it on every save
-/// (Phase 0 finding F14), so it must never take part in diffs/merges/hashes.
+/// NOTE: map uid is deliberately NOT here — the game regenerates it on every save,
+/// so it must never take part in diffs/merges/hashes.
 /// Repo identity comes from MapGit's own stable repo id instead.</summary>
 public sealed record ManifestMapInfo
 {

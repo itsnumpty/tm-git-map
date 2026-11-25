@@ -1,11 +1,10 @@
-// Merge.as — Phase D: 3-way merge engine (port of MapGit.Core ThreeWayMerge +
-// ManifestDiff), manifest reader, merge-base, live apply via E++, and the merge UI.
+// Merge.as — 3-way merge engine, manifest reader, merge-base, live apply via E++,
+// conflict markers/previews, and the developer merge UI.
 //
-// Semantics (faithful to the C# reference): changes base->theirs are applied onto
-// ours; anywhere ours also diverged from base becomes a conflict. Conflicts are
-// resolved ours/theirs/both/none; a completed merge applies to the LIVE map,
-// verifies (rebuilt manifest must hash-match the computed result, else restore),
-// and lands as a two-parent commit.
+// Semantics: changes base->theirs are applied onto ours; anywhere ours also diverged
+// from base becomes a conflict. Conflicts are resolved ours/theirs/both/none; a
+// completed merge applies to the live map, verifies (rebuilt manifest must hash-match
+// the computed result, else restore), and lands as a two-parent commit.
 
 // ------------------------- manifest reader (store -> MGManifest) -------------------------
 
@@ -115,7 +114,7 @@ MGManifest@ MG_ReadManifest(const string&in path) {
     }
 }
 
-// ------------------------- equality (C# JsonNode.DeepEquals equivalent) -------------------------
+// ------------------------- equality -------------------------
 
 bool MG_Vec3Eq(const vec3&in a, const vec3&in b) {
     return a.x == b.x && a.y == b.y && a.z == b.z;
@@ -1466,8 +1465,7 @@ string MG_BaseKey(const string&in key) {
     return key.SubStr(0, h);
 }
 
-// Restores the canonical form (the C# engine's ToManifest step): base keys,
-// canonical sort, deterministic re-suffixing. Without this, merged manifests
+// Restores the canonical form: base keys, canonical sort, deterministic re-suffixing. Without this, merged manifests
 // list appended theirs-entries out of order and never hash-match a rebuild.
 void MG_Recanonicalize(MGManifest@ m) {
     for (uint i = 0; i < m.blocks.Length; i++) {

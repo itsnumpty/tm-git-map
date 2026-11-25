@@ -10,7 +10,7 @@ public sealed record GitSpikeResult(
     string MergeStatus);
 
 /// <summary>
-/// Phase 0 spike: prove the LibGit2Sharp operations we need for the engine
+/// Local smoke check for LibGit2Sharp operations used by the engine
 /// (init, commit, branch, checkout, merge commit with two parents) work locally.
 /// </summary>
 public static class GitSpike

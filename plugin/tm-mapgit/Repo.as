@@ -1,5 +1,5 @@
 // Repo.as — local repository for the open map: content-addressed object store,
-// commits, refs (Phase B.2). Layout (file-based port of the C# reference design):
+// commits, and refs. Layout:
 //   <Documents>/Trackmania/MapGit/<repoId>/
 //     repo.meta.json, HEAD ("ref: refs/heads/main")
 //     refs/heads/<branch>            (commit sha)
@@ -67,8 +67,7 @@ string MG_ReposRoot() {
 
 // ------------------------- hashing (native Crypto) -------------------------
 
-// Openplanet strings carry raw bytes, so ReadToEnd() + Crypto::Sha256 works for
-// binary files too (cross-checked against .NET Get-FileHash in the self-test).
+// Openplanet strings carry raw bytes, so ReadToEnd() + Crypto::Sha256 works for binary files.
 string MG_Sha256File(const string&in path) {
     IO::File f(path, IO::FileMode::Read);
     string bytes = f.ReadToEnd();
@@ -379,7 +378,7 @@ void MG_CreateBranchCoro() {
 }
 
 // Real branch switching: refuse when dirty, restore the target blob to the map
-// file, then reopen the map in the editor (verified S9 mechanism).
+// file, then reopen the map in the editor.
 void MG_CheckoutCoro() {
     g_mgRepoBusy = true;
     CGameCtnChallenge@ map = GetMap();
@@ -440,7 +439,7 @@ void MG_CheckoutCoro() {
     MG_WriteTextFile(repoDir + "/HEAD", "ref: refs/heads/" + target);
     MG_Log("checkout: restored " + MG_Short(tBlob) + " to the map file; reopening editor...");
 
-    // 3) reopen the map (verified S9 pattern: BackToMainMenu + readiness + EditMap)
+    // 3) reopen the map (BackToMainMenu + readiness + EditMap)
     if (!Permissions::OpenAdvancedMapEditor()) {
         MG_Log("checkout: no advanced-editor permission — reopen the map manually");
         g_mgRepoBusy = false;
@@ -475,9 +474,8 @@ void MG_CheckoutCoro() {
 
 string g_mgAutoRepoKey = ""; // last repo the tab auto-loaded (fast, no manifest build)
 
-// One-time adoption for the one-shared-map model: if the repo's current line
-// isn't 'main' (left over from branch-era testing), adopt its content as 'main'
-// — but only when nothing on the existing main line would be orphaned.
+// If the repo's current line isn't 'main', adopt its content as 'main' —
+// only when nothing on an existing main line would be orphaned.
 bool MG_IsAncestor(const string&in repoDir, const string&in maybeAncestor, const string&in tip) {
     string cur = tip;
     for (uint i = 0; i < 1000 && cur.Length > 0; i++) {
@@ -527,7 +525,7 @@ void MG_AutoLoadRepoState(CGameCtnChallenge@ map) {
         }
         // automatic dirty check (runs in a coroutine; the UI stays responsive)
         if (!g_mgRepoBusy) startnew(MG_RefreshStatusCoro);
-        // check the shared map for teammate changes (one cheap GET)
+        // check the shared map for collaborator changes (one cheap GET)
         g_mgRemoteSentence = "";
         if (g_ghToken.Length > 0) MG_CheckRemoteCoro();
     } else {

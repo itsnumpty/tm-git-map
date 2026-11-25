@@ -5,9 +5,8 @@ namespace MapGit.Core.Manifest;
 
 /// <summary>
 /// Content hash tolerant to last-bit float re-computation noise. The game rewrites a
-/// handful of float values inside embedded item GBXes on every save (Phase 0 F11:
-/// identical items differed in exactly 6 bytes — a run of floats whose bits change in
-/// the last bits; the run was NOT aligned to the file start).
+/// handful of float values inside embedded item GBXes on every save (identical items
+/// can differ in a run of floats whose lowest bits drift, not aligned to the file start).
 ///
 /// Strategy: a single forward scan at BYTE granularity. Wherever a run of consecutive
 /// plausible floats is found (a float struct, at its own alignment), each float is

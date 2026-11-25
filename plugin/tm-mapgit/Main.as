@@ -1,5 +1,4 @@
-// tm-mapgit — git-style version control for Trackmania maps (Phase B).
-// Architecture: plugin-only runtime; the C# solution is the conformance harness.
+// tm-mapgit — git-style version control for Trackmania maps.
 
 [Setting name="Developer terminology (git terms)"]
 bool S_DevTerms = false;
@@ -51,7 +50,7 @@ void RenderMenu() {
 
 void Render() {
     MG_DrawConflictMarkersFrame(); // 3D conflict wireframes (draws even with the window closed)
-    MG_RemoteCheckTick();         // periodic teammate-changes check + notification
+    MG_RemoteCheckTick();         // periodic collaborator-changes check + notification
     if (!g_windowVisible) return;
     MG_RenderMainWindow();
 }

@@ -48,8 +48,7 @@ public static class ManifestCanonicalizer
     {
         // Note: sort must be TOTAL (key, then name, then full content). The game reorders
         // same-cell duplicate blocks between saves; without the content tiebreaker the
-        // deterministic "#2" suffixes can flip between identical blocks, producing false
-        // diffs (Phase 0 finding F15).
+        // deterministic "#2" suffixes can flip between identical blocks, producing false diffs.
         var blocks = manifest.Blocks
             .Select(b => b with { Key = ManifestKeys.Block(b) })
             .OrderBy(b => b.Key, StringComparer.Ordinal)

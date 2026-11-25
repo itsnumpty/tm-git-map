@@ -1,7 +1,6 @@
-// TolerantHash.as — port of MapGit.Core.Manifest.TolerantHash.
-// Content hash tolerant to last-bit float re-computation noise inside embedded
-// item GBXes (Phase 0 F11). Byte-scan for runs of plausible floats, quantize to
-// ~1/1024 relative precision, SHA-256 the normalized buffer.
+// TolerantHash.as — content hash tolerant to last-bit float re-computation noise
+// inside embedded item GBXes. Byte-scans for runs of plausible floats, quantizes
+// to ~1/1024 relative precision, and SHA-256 hashes the normalized buffer.
 
 string MG_TolerantFingerprintBytes(MemoryBuffer@ data) {
     if (data is null) return "";

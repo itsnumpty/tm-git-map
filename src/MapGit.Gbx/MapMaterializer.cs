@@ -11,7 +11,7 @@ namespace MapGit.Maps;
 /// <summary>
 /// Headless materialization: transforms a parsed map (loaded from "ours") so that its
 /// canonical manifest becomes the target manifest (typically a clean merge result).
-/// The in-game plugin implements the same semantics on the live map in Phase 1.
+/// The in-game plugin implements the same semantics on the live map.
 ///
 /// Strictness: placement of blocks/items with skins, waypoint properties or decals is
 /// not supported yet and throws — better a loud failure than silent content loss.

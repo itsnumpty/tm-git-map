@@ -1,6 +1,5 @@
-// GitHub.as — Phase C.1: device-flow auth + push to a real GitHub repository via
-// the git database REST API (blobs/trees/commits/refs). Remotes are genuine,
-// cloneable git repos. Port of the S12-verified spike flow.
+// GitHub.as — device-flow auth + push/pull to a GitHub repository via the git
+// database REST API (blobs/trees/commits/refs). Remotes are standard git repos.
 //
 // Remote layout per repo:
 //   map.Map.Gbx      — the blob snapshot (base64 git blob)
@@ -73,7 +72,7 @@ void GH_LoadToken() {
     }
 }
 
-// ------------------------- device flow (S12-verified pattern) -------------------------
+// ------------------------- device flow -------------------------
 
 // For tokens saved before the login was recorded.
 void GH_FetchLoginCoro() {
@@ -539,7 +538,7 @@ void GH_PushWork() {
         if (tree is null) { g_ghBusy = false; g_ghStatus = "tree creation failed"; return; }
         string gitTree = tree["sha"];
 
-        // commit (message = mapgit header + user message, like the C# engine)
+        // commit (message = mapgit header + user message)
         string msg = "mapgit:v1 manifest:" + manifest + " blob:" + blob + "\n\n" + message +
                      " (MapGit commit " + localSha.SubStr(0, 10) + ")";
         string commitBody = "{\"message\":\"" + msg.Replace("\"", "'").Replace("\n", "\\n") +
@@ -561,7 +560,7 @@ void GH_PushWork() {
     } else if (existing !is null) {
         string remoteTipNow = existing["object"]["sha"];
         if (lastGit.Length > 0 && remoteTipNow != lastGit) {
-            // Teammate pushed since we last synced — refuse rather than clobber.
+            // Collaborator pushed since we last synced — refuse rather than clobber.
             MG_Log("push: remote moved to " + MG_Short(remoteTipNow) + " (last synced " + MG_Short(lastGit) +
                    ") — Update/combine first");
             g_ghStatus = "remote has new changes — Update first";

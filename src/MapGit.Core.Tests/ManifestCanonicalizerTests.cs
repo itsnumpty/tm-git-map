@@ -60,9 +60,8 @@ public class ManifestCanonicalizerTests
     [Fact]
     public void same_cell_duplicates_are_ordered_by_content_not_input_order()
     {
-        // Real-world case from Ninconpoop (F15): two DecoCliffVFC blocks in one cell; the
-        // game reorders them between saves, and a non-total sort made the "#2" suffix flip
-        // between identical-key blocks, producing false direction/variant diffs.
+        // Two DecoCliffVFC blocks in one cell; the game reorders them between saves, so a
+        // non-total sort would flip "#2" suffixes and produce false direction/variant diffs.
         var b1 = Block("", "DecoCliffVFC") with { Direction = 1, Variant = 4 };
         var b2 = Block("", "DecoCliffVFC") with { Direction = 0, Variant = 2 };
 

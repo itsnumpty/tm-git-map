@@ -54,7 +54,7 @@ string MG_MediaFingerprint(CGameCtnChallenge@ map) {
     return Crypto::Sha256(s).SubStr(0, 16);
 }
 
-// Optional commit fields added after v1 ("media", "items"); "" when absent.
+// Optional commit fields ("media", "items"); "" when absent on older commits.
 string MG_ReadCommitExtra(const string&in repoDir, const string&in sha, const string&in field) {
     if (sha.Length == 0) return "";
     string text = MG_ReadTextFile(repoDir + "/commits/" + sha + ".json");

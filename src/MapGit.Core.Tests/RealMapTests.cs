@@ -4,7 +4,7 @@ using Xunit.Abstractions;
 namespace MapGit.Core.Tests;
 
 /// <summary>
-/// Phase 0 checks against real maps (fixtures/maps, git-ignored local files).
+/// Checks against real maps (fixtures/maps, git-ignored local files).
 /// Silently passes when fixtures are absent.
 /// </summary>
 public class RealMapTests
@@ -52,10 +52,8 @@ public class RealMapTests
     [Fact]
     public void resaved_map_has_identical_manifest_to_original()
     {
-        // Phase 1 acceptance: two real saves of the same map with no edits (vanilla is
-        // the Sep-4 save, vanilla-resaved went through multiple Nov-19 in-game save
-        // cycles) must produce the SAME canonical manifest: uid is excluded and the
-        // embedded fingerprint is float-noise tolerant (F11/F14).
+        // Two real saves of the same map with no edits must produce the SAME canonical
+        // manifest: uid is excluded and the embedded fingerprint is float-noise tolerant.
         var root = RepoRoot();
         var original = Path.Combine(root, "fixtures", "maps", "vanilla.Map.Gbx");
         var resaved = Path.Combine(root, "fixtures", "maps", "vanilla-resaved.Map.Gbx");

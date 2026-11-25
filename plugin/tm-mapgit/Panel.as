@@ -464,7 +464,7 @@ void RenderHistoryPage() {
     }
 }
 
-// Checks the shared map's remote for changes teammates made (cheap: one GET).
+// Checks the shared map's remote for collaborator changes (cheap: one GET).
 // Called automatically every few minutes (see MG_RemoteCheckTick) and on panel load.
 string g_mgNotifiedRemoteGit = ""; // last remote tip we notified about (dedupe)
 
@@ -540,7 +540,7 @@ void MG_RemoteCheckTick() {
 
 string g_mgShareNote = "";
 
-// ------------------------- share / get (stage 1: commit+push / pull) -------------------------
+// ------------------------- share / get -------------------------
 
 // Share: save unsaved work as a version, then upload to the shared map.
 void MG_ShareCoro() {
