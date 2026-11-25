@@ -3,7 +3,8 @@
 MapGit lets a group of mappers build **one shared map together** without anyone
 needing to know what git is. You edit; MapGit remembers every version, syncs
 with your team through GitHub, and — when two people change *the same block* —
-shows the conflict **in the 3D world** and lets you pick a winner visually.
+shows the conflict **in the 3D world** (real ghost models where possible) and
+lets you pick a winner visually.
 
 Everything runs inside Trackmania as an [Openplanet](https://openplanet.dev)
 plugin. No external apps, no command line, no git.
@@ -14,17 +15,21 @@ plugin. No external apps, no command line, no git.
   timeline: *who* changed *what*, *when*.
 - **Share** — saves your current work and sends it to the shared map. If a
   teammate changed something else meanwhile, both sets of changes combine
-  automatically.
+  automatically (or you resolve conflicts in the world first).
 - **Update** — brings in the changes your teammates shared. The panel tells you
   when there's something new ("Your team shared new changes — Update to see them").
 - **Stamps** — name a checkpoint (`before-rework`, `v1-beta`) and go back to it
   any time. Going back never destroys history — your next share becomes a new
   version on top.
 - **Visual conflict resolution** — when you and a teammate changed the same
-  block or item, MapGit draws it in the world: **green wireframe = yours**,
-  **red ghost = theirs**. Click *go to it* to fly the camera there, then choose
-  per conflict: **Keep mine / Take theirs / Keep both / Remove**. Resolve, apply,
-  done — a merge version lands in the timeline for everyone.
+  block or item, MapGit places a **real ghost model** of theirs in the world
+  (wireframe fallback if the model isn't in inventory) and outlines yours in
+  green. Click *go to it* to fly the camera there, then choose per conflict:
+  **Keep mine / Take theirs / Keep both / Remove**. Resolve, **Apply & Share**,
+  done.
+- **Custom / embedded items** — manifests fingerprint embedded files (TolerantHash);
+  merge tries to resolve custom models via inventory / reload. See
+  [docs/status.md](docs/status.md) for limits.
 - **Real GitHub repositories under the hood** — each map is a genuine git repo
   (`map.Map.Gbx` + `manifest.json` per version), cloneable by power users, but
   mappers never have to touch it.
@@ -32,7 +37,7 @@ plugin. No external apps, no command line, no git.
 ## Install
 
 1. Install [Openplanet Next](https://openplanet.dev) and [Editor++](https://github.com/XertroV/openplanet-editorplus)
-   (MapGit depends on it for editor operations and 3D drawing).
+   (MapGit depends on the `Editor` plugin for editor operations and 3D drawing).
 2. Copy (or junction) `plugin/tm-mapgit` into `OpenplanetNext/Plugins/`.
 3. Start the game and open the map editor. MapGit appears in the menu bar.
 
@@ -66,9 +71,10 @@ plugin. No external apps, no command line, no git.
 
 Enable **Developer tools** in the plugin settings to reveal the full git-facing
 UI: version lines (branches), switching (checkout), raw upload/download
-(push/pull), manifest dumps, and the terminology switch that flips every label
-between plain language and git terms. The shared map is the `main` branch of
-the map's GitHub repository; everything is standard git underneath.
+(push/pull), manifest dumps, merge from `origin/<branch>`, and the terminology
+switch that flips every label between plain language and git terms. The shared
+map is the `main` branch of the map's GitHub repository; everything is standard
+git underneath.
 
 ## The C# engine (this repository's other half)
 
@@ -86,7 +92,7 @@ harness** — the spec the plugin's AngelScript ports are validated against:
 
 ```
 dotnet build MapGit.slnx          # note: use --no-incremental for full rebuilds
-dotnet test  MapGit.slnx          # 37/37: merge scenarios, repo flows, real maps
+dotnet test  MapGit.slnx          # merge scenarios, repo flows, real maps
 ```
 
 The plugin's manifest builder is validated against the engine on real maps
@@ -101,14 +107,14 @@ work (MIT) and does not link it.
 plugin/tm-mapgit/        the Openplanet plugin (the product)
 plugin/tm-mapgit-spikes/ the verification spike plugin (API proofs, kept as reference)
 src/                     the C# reference engine + conformance harness + CLI
-docs/                    phase reports and progress notes
+docs/                    status and known limits
 ```
 
 ## Status
 
-In active development (Phases A–C verified in-game: extraction, commits,
-version lines, GitHub sync incl. disaster recovery; merge + visual conflicts
-landing now). See `docs/phase-1-progress.md` for the detailed history.
+Collaborative Share/Update (including diverge → visual merge), ghost model
+previews, skins, embedded fingerprints, and everyday UX are implemented.
+See [docs/status.md](docs/status.md) for the detailed shipped / known-limits list.
 
 ## Conventions
 

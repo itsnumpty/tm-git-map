@@ -12,13 +12,40 @@ string T(const string&in friendly, const string&in gitTerm) {
 }
 
 void Main() {
+    MG_LoadFonts();
     GH_LoadToken();
-    print("MapGit v0.1.0 loaded. Open the MapGit window from the menu bar.");
+    if (!S_OnboardingDone) MG_OnboardingStart();
+    print("MapGit v0.2.1 loaded. Open the MapGit window from the menu bar.");
+    GH_FetchLoginCoro();
+    if (g_ghToken.Length > 0) {
+        MG_JoinRefreshListsWork();
+        if (g_mgJoinInvites.Length > 0) {
+            UI::ShowNotification("MapGit", "You've been invited to " + g_mgJoinInvites.Length
+                + (g_mgJoinInvites.Length == 1 ? " map" : " maps") + ". Open MapGit > Join a map.");
+        }
+    }
 }
 
 void RenderMenu() {
-    if (UI::MenuItem("\\$0f0" + Icons::CodeBranch + "\\$z MapGit", "", g_windowVisible)) {
-        g_windowVisible = !g_windowVisible;
+    if (UI::BeginMenu("\\$0f0" + Icons::CodeBranch + "\\$z MapGit")) {
+        if (UI::MenuItem(Icons::Home + " Show window", "", g_windowVisible)) g_windowVisible = !g_windowVisible;
+        if (UI::MenuItem(Icons::QuestionCircle + " Setup & walkthrough")) MG_OnboardingStart();
+        if (UI::MenuItem(Icons::Download + " Join a shared map")) {
+            g_windowVisible = true;
+            g_mgOnbOpen = false;
+            S_Page = MG_PAGE_JOIN;
+        }
+        if (UI::MenuItem(Icons::Github + " GitHub & activity")) {
+            g_windowVisible = true;
+            g_mgOnbOpen = false;
+            S_Page = MG_PAGE_GITHUB;
+        }
+        if (UI::MenuItem(Icons::Cog + " Settings")) {
+            g_windowVisible = true;
+            g_mgOnbOpen = false;
+            S_Page = MG_PAGE_SETTINGS;
+        }
+        UI::EndMenu();
     }
 }
 
@@ -26,34 +53,7 @@ void Render() {
     MG_DrawConflictMarkersFrame(); // 3D conflict wireframes (draws even with the window closed)
     MG_RemoteCheckTick();         // periodic teammate-changes check + notification
     if (!g_windowVisible) return;
-    UI::SetNextWindowSize(600, 520, UI::Cond::FirstUseEver);
-    if (S_DevTools) {
-        UI::Begin(Icons::CodeBranch + " MapGit", g_windowVisible);
-        UI::BeginTabBar("mapgit-tabs");
-        if (UI::BeginTabItem("Status")) {
-            RenderStatusTab();
-            UI::EndTabItem();
-        }
-        if (UI::BeginTabItem("Manifest")) {
-            RenderManifestTab();
-            UI::EndTabItem();
-        }
-        if (UI::BeginTabItem(T("Versions", "Repository"))) {
-            RenderRepoTab();
-            UI::EndTabItem();
-        }
-        if (UI::BeginTabItem("GitHub")) {
-            RenderGitHubTab();
-            UI::EndTabItem();
-        }
-        UI::EndTabBar();
-        UI::End();
-    } else {
-        // everyday UI: one map, one panel, no git concepts
-        UI::Begin(Icons::CodeBranch + " MapGit", g_windowVisible);
-        RenderMainPanel();
-        UI::End();
-    }
+    MG_RenderMainWindow();
 }
 
 void RenderStatusTab() {
@@ -79,6 +79,7 @@ void RenderStatusTab() {
 
 void MG_Log(const string&in msg) {
     print("MapGit: " + msg);
+    MG_ActivityAdd(msg);
 }
 
 CGameCtnEditorFree@ GetEditorFree() {

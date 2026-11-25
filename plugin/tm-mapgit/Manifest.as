@@ -81,11 +81,23 @@ class MGMapInfo {
     bool hasGhostBlocks;
 }
 
+class MGEmbeddedEntry {
+    string name;
+    string fingerprint; // TolerantHash of entry bytes
+
+    int opCmp(const MGEmbeddedEntry&in other) {
+        if (name != other.name) return name < other.name ? -1 : 1;
+        if (fingerprint != other.fingerprint) return fingerprint < other.fingerprint ? -1 : 1;
+        return 0;
+    }
+}
+
 class MGManifest {
     MGMapInfo@ mapInfo;
     array<MGBlock> blocks;
     array<MGItem> items;
     int embeddedEntryCount = 0;
+    array<MGEmbeddedEntry> embeddedEntries;
 }
 
 // ------------------------- keys (port of ManifestKeys) -------------------------
@@ -271,8 +283,103 @@ MGManifest@ MG_BuildManifest(CGameCtnChallenge@ map) {
     MG_SuffixBlocks(m.blocks);
     MG_SuffixItems(m.items);
 
-    m.embeddedEntryCount = 0; // embedded entries: full TolerantHash port is future work (see docs)
+    MG_FillEmbedded(m);
     return m;
+}
+
+// Enumerate CurrentMap_EmbeddedFiles via Fids and fingerprint each leaf.
+void MG_FillEmbedded(MGManifest@ m) {
+    m.embeddedEntries.RemoveRange(0, m.embeddedEntries.Length);
+    m.embeddedEntryCount = 0;
+    CSystemFidsFolder@ folder = MG_FindEmbeddedFolder();
+    if (folder is null) return;
+    try {
+        MG_CollectEmbeddedLeaves(folder, "", m.embeddedEntries);
+    } catch {
+        MG_Log("manifest: embedded enum failed: " + getExceptionInfo());
+        return;
+    }
+    m.embeddedEntries.SortAsc();
+    m.embeddedEntryCount = int(m.embeddedEntries.Length);
+}
+
+CSystemFidsFolder@ MG_FindEmbeddedFolder() {
+    string[] drives = { "fake", "user", "game", "programdata", "resource" };
+    for (uint d = 0; d < drives.Length; d++) {
+        CSystemFidsFolder@ candidate = MG_TryGetFidsFolder(drives[d], "CurrentMap_EmbeddedFiles");
+        if (candidate !is null) return candidate;
+    }
+    CSystemFidsFolder@ viaMem = Fids::GetFakeFolder("MemoryTemp/CurrentMap_EmbeddedFiles");
+    if (viaMem !is null) return viaMem;
+    return null;
+}
+
+CSystemFidsFolder@ MG_TryGetFidsFolder(const string&in drive, const string&in path) {
+    if (drive == "fake") return Fids::GetFakeFolder(path);
+    if (drive == "user") return Fids::GetUserFolder(path);
+    if (drive == "game") return Fids::GetGameFolder(path);
+    if (drive == "programdata") return Fids::GetProgramDataFolder(path);
+    if (drive == "resource") return Fids::GetResourceFolder(path);
+    return null;
+}
+
+void MG_CollectEmbeddedLeaves(CSystemFidsFolder@ folder, const string&in prefix, array<MGEmbeddedEntry>@ outEntries) {
+    try { Fids::UpdateTree(folder); } catch { }
+    auto leaves = folder.Leaves;
+    for (uint i = 0; i < leaves.Length; i++) {
+        CSystemFidFile@ leaf = leaves[i];
+        if (leaf is null) continue;
+        string name = prefix + leaf.FileName;
+        string fp = "";
+        try {
+            // Prefer extracting bytes when the Fid has an absolute path
+            string full = leaf.FullFileName;
+            if (full.Length > 0 && IO::FileExists(full)) {
+                fp = MG_TolerantFingerprintFile(full);
+            }
+        } catch { }
+        MGEmbeddedEntry e;
+        e.name = name;
+        e.fingerprint = fp;
+        outEntries.InsertLast(e);
+    }
+    auto trees = folder.Trees;
+    for (uint i = 0; i < trees.Length; i++) {
+        string dir = trees[i].DirName;
+        MG_CollectEmbeddedLeaves(trees[i], prefix + dir + "/", outEntries);
+    }
+}
+
+// Stable string of "name:fingerprint" pairs for set equality in merge.
+string MG_EmbeddedFingerprintSet(MGManifest@ m) {
+    if (m is null) return "";
+    string s = "";
+    for (uint i = 0; i < m.embeddedEntries.Length; i++) {
+        if (i > 0) s += "|";
+        s += m.embeddedEntries[i].name + ":" + m.embeddedEntries[i].fingerprint;
+    }
+    if (s.Length == 0 && m.embeddedEntryCount > 0) return "count:" + m.embeddedEntryCount;
+    return s;
+}
+
+// Best-effort: reload item paths named in theirs' embedded list so PlaceItems can resolve them.
+void MG_EnsureTheirsEmbeddedAvailable(const string&in repoDir, const string&in theirsBlobSha, MGManifest@ theirsMan) {
+    if (theirsMan is null || theirsMan.embeddedEntries.Length == 0) return;
+    array<string> paths;
+    for (uint i = 0; i < theirsMan.embeddedEntries.Length; i++) {
+        string n = theirsMan.embeddedEntries[i].name;
+        if (n.Length == 0) continue;
+        paths.InsertLast(n);
+    }
+    if (paths.Length == 0) return;
+    try {
+        Editor::ReloadItemsAsync(paths);
+        MG_Log("merge: requested ReloadItemsAsync for " + paths.Length + " embedded paths from theirs");
+    } catch {
+        MG_Log("merge: ReloadItemsAsync unavailable or failed: " + getExceptionInfo());
+    }
+    // Hint: custom items must be in the player's Items folder or already embedded in the live map.
+    // Full zip install from the theirs .gbx blob is not available in-plugin (no LZO unpacker).
 }
 
 void MG_SuffixBlocks(array<MGBlock>@ arr) {
@@ -399,7 +506,13 @@ void MG_WriteManifest(MGManifest@ m, const string&in path) {
         if (i > 0) f.Write(",");
         f.Write(MG_ItemJson(m.items[i]));
     }
-    f.Write("],\"embedded\":{\"entryCount\":" + m.embeddedEntryCount + ",\"entries\":[]}}");
+    f.Write("],\"embedded\":{\"entryCount\":" + m.embeddedEntryCount + ",\"entries\":[");
+    for (uint i = 0; i < m.embeddedEntries.Length; i++) {
+        if (i > 0) f.Write(",");
+        f.Write("{\"name\":" + MG_JsonStr(m.embeddedEntries[i].name) +
+                ",\"fingerprint\":" + MG_JsonStr(m.embeddedEntries[i].fingerprint) + "}");
+    }
+    f.Write("]}}");
     f.Close();
 }
 

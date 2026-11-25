@@ -9,7 +9,14 @@
 // Repo identity = deterministic id from the map file path (never the game uid).
 
 [Setting name="MapGit author name"]
-string S_MGAuthor = "its_numpty";
+string S_MGAuthor = "";
+
+// Name recorded on versions: the chosen name, else the GitHub login.
+string MG_AuthorName() {
+    if (S_MGAuthor.Length > 0) return S_MGAuthor;
+    if (g_ghLogin.Length > 0) return g_ghLogin;
+    return "someone";
+}
 
 bool g_mgRepoBusy = false;
 string g_mgRepoStatusText = "status not loaded yet";
@@ -87,6 +94,13 @@ string MG_RepoIdFor(const string&in mapFileRaw) {
                .Replace("?", "-").Replace("\"", "-").Replace("<", "-").Replace(">", "-")
                .Replace("|", "-").Replace(" ", "_");
     return stem + "-" + Crypto::Sha256(mapFile).SubStr(0, 8);
+}
+
+// A brand-new map has no file until it's saved once; nothing can be versioned before that.
+bool MG_MapIsSaved(CGameCtnChallenge@ map) {
+    if (map is null) return false;
+    string f = map.MapInfo.FileName;
+    return f.Length > 0;
 }
 
 // The open map's file path, normalized to forward slashes.
@@ -196,7 +210,8 @@ void MG_RefreshStatusCoro() {
         string parents, tm, tb, author, message;
         int64 time;
         if (MG_ReadCommit(repoDir, g_mgRepoTip, parents, tm, tb, author, message, time)) {
-            g_mgRepoStatusText = (tm == msha) ? "clean (manifest matches HEAD)"
+            bool same = tm == msha && !MG_MediaChangedSince(map, repoDir, g_mgRepoTip, false);
+            g_mgRepoStatusText = same ? "clean (manifest matches HEAD)"
                                               : "dirty (manifest differs from HEAD " + MG_Short(g_mgRepoTip) + ")";
             MG_LoadLog(repoDir, g_mgRepoTip);
         } else {
@@ -213,6 +228,12 @@ void MG_CommitCoro() {
     g_mgRepoBusy = true;
     CGameCtnChallenge@ map = GetMap();
     if (map is null) { MG_Log("commit: no map open"); g_mgRepoBusy = false; return; }
+    if (!MG_MapIsSaved(map)) {
+        g_mgRepoStatusText = "save your map with a name first";
+        MG_Log("commit: the map has never been saved — save it with a name first");
+        g_mgRepoBusy = false;
+        return;
+    }
     string mapFile = MG_MapFileOf(map);
     string repoId = MG_RepoIdFor(mapFile);
     string repoDir = MG_ReposRoot() + "/" + repoId;
@@ -248,10 +269,11 @@ void MG_CommitCoro() {
     string bsha = MG_Sha256File(mapPath);
     MG_Log("commit: manifest " + MG_Short(msha) + ", blob " + MG_Short(bsha));
 
-    // 4) branch/tip + dirty check
+    // 4) branch/tip + dirty check (MediaTracker clips aren't in the manifest)
     string branch = MG_CurrentBranch(repoDir);
     string tip = MG_TipSha(repoDir, branch);
-    if (tip.Length > 0) {
+    string mediaFp = MG_MediaFingerprint(map);
+    if (tip.Length > 0 && !MG_MediaChangedSince(map, repoDir, tip)) {
         string parents, tm, tb, author, message;
         int64 time;
         if (MG_ReadCommit(repoDir, tip, parents, tm, tb, author, message, time)) {
@@ -274,6 +296,7 @@ void MG_CommitCoro() {
     MG_CopyFile(tmpManifest, repoDir + "/objects/manifests/" + msha + ".json");
     yield();
     MG_CopyFile(mapPath, repoDir + "/objects/blobs/" + bsha + ".gbx");
+    string customFiles = MG_SnapshotCustomFiles(m, repoDir);
 
     // 6) commit object (sha = sha256 of the canonical commit json itself).
     // A merge adds a second parent (set by the merge flow).
@@ -284,8 +307,9 @@ void MG_CommitCoro() {
     }
     string msg = g_mgCommitMsg.Length > 0 ? g_mgCommitMsg : "work in progress";
     string commitJson = "{\"parents\":\"" + parentsCsv + "\",\"manifest\":\"" + msha + "\",\"blob\":\"" + bsha +
-        "\",\"author\":\"" + S_MGAuthor + "\",\"message\":" + MG_JsonStr(msg) +
+        "\",\"author\":\"" + MG_AuthorName() + "\",\"message\":" + MG_JsonStr(msg) +
         ",\"time\":" + Time::Stamp +
+        ",\"media\":" + MG_JsonStr(mediaFp) + ",\"items\":" + MG_JsonStr(customFiles) +
         ",\"header\":\"mapgit:v1 manifest:" + msha + " blob:" + bsha + "\"}";
     string tmpCommit = IO::FromStorageFolder("commit-tmp.json");
     MG_WriteTextFile(tmpCommit, commitJson);
@@ -383,7 +407,7 @@ void MG_CheckoutCoro() {
     if (!MG_ReadCommit(repoDir, tip, parents, tm, tb, author, message, time)) {
         MG_Log("checkout: HEAD commit unreadable"); g_mgRepoBusy = false; return;
     }
-    if (tm != msha) {
+    if (tm != msha || MG_MediaChangedSince(map, repoDir, tip, false)) {
         g_mgRepoStatusText = "checkout refused: uncommitted changes (commit or undo them first)";
         MG_Log("checkout: refused — working map differs from HEAD " + MG_Short(tip));
         g_mgRepoBusy = false;

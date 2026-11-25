@@ -1,4 +1,5 @@
 # Build output
+dist/
 bin/
 obj/
 *.user
@@ -9,5 +10,8 @@ fixtures/maps/
 
 # Local Openplanet dev install
 OpenplanetNext/
+
+# Third-party source kept locally for reference (Editor++ by XertroV)
+reference/
 
 docs/

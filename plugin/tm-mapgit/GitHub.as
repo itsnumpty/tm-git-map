@@ -35,6 +35,9 @@ bool g_ghBusy = false;
 string g_ghRepoName = "";
 bool g_ghPrivate = true;
 string g_ghExistingRepo = ""; // "owner/name" to bind without creating
+string g_ghBindOwner = "";     // pending explicit bind, consumed by the next push
+string g_ghBindRepo = "";
+bool g_ghConfirmUnlink = false;
 int g_ghLastCode = 0;
 
 string GH_ClientId() {
@@ -71,6 +74,15 @@ void GH_LoadToken() {
 }
 
 // ------------------------- device flow (S12-verified pattern) -------------------------
+
+// For tokens saved before the login was recorded.
+void GH_FetchLoginCoro() {
+    if (g_ghToken.Length == 0 || g_ghLogin.Length > 0) return;
+    Json::Value@ me = GH_Api("GET", "https://api.github.com/user", "");
+    if (me is null) return;
+    g_ghLogin = me["login"];
+    GH_SaveToken();
+}
 
 void GH_StartDeviceFlow() {
     if (GH_ClientId().Length == 0) {
@@ -135,9 +147,13 @@ void GH_DeviceFlowCoro() {
         if (tj !is null && tj.HasKey("access_token")) {
             g_ghToken = tj["access_token"];
             g_ghUserCode = "";
+            g_ghLogin = "";
+            Json::Value@ me = GH_Api("GET", "https://api.github.com/user", "");
+            if (me !is null) g_ghLogin = me["login"];
             GH_SaveToken();
-            MG_Log("GitHub: token acquired (" + g_ghToken.Length + " chars, stored in plugin storage)");
-            UI::ShowNotification("MapGit", "GitHub linked!");
+            g_ghStatus = "connected";
+            MG_Log("GitHub: connected" + (g_ghLogin.Length > 0 ? " as " + g_ghLogin : "") + " (token stored in plugin storage)");
+            UI::ShowNotification("MapGit", "GitHub connected" + (g_ghLogin.Length > 0 ? " as " + g_ghLogin : "") + "!");
             g_ghBusy = false;
             return;
         }
@@ -147,10 +163,14 @@ void GH_DeviceFlowCoro() {
         if (err == "authorization_pending") continue;
         if (err == "slow_down") { interval += 5; continue; }
         MG_Log("GitHub: device flow error: " + err);
+        g_ghStatus = err == "access_denied" ? "GitHub connection was cancelled" : "GitHub connection failed";
+        g_ghUserCode = "";
         g_ghBusy = false;
         return;
     }
     MG_Log("GitHub: device flow expired");
+    g_ghStatus = "GitHub code expired — try connecting again";
+    g_ghUserCode = "";
     g_ghBusy = false;
 }
 
@@ -178,6 +198,7 @@ Json::Value@ GH_Api(const string&in method, const string&in url, const string&in
     while (!req.Finished()) yield();
 
     g_ghLastCode = req.ResponseCode();
+    if (req.Error() == "" && g_ghLastCode == 204) return Json::Object(); // success, no body
     if (req.Error() != "" || (g_ghLastCode != 200 && g_ghLastCode != 201)) {
         if (g_ghLastCode == 401) {
             // the stored token is dead (revoked/expired) — clear it so the panel
@@ -210,6 +231,9 @@ string MG_RemoteCfgPath(const string&in repoDir) {
 }
 
 bool GH_ReadRemote(const string&in repoDir) {
+    // Never let an unbound map inherit the previously viewed map's binding.
+    g_ghOwner = "";
+    g_ghRepo = "";
     string text = MG_ReadTextFile(MG_RemoteCfgPath(repoDir));
     if (text.Length == 0) return false;
     try {
@@ -226,27 +250,79 @@ bool GH_ReadRemote(const string&in repoDir) {
 void GH_WriteRemote(const string&in repoDir) {
     MG_WriteTextFile(MG_RemoteCfgPath(repoDir),
         "{\"owner\":\"" + g_ghOwner + "\",\"repo\":\"" + g_ghRepo + "\"}");
+    g_mgRemoteCacheDir = "";
 }
 
-string GH_RemoteStatePath(const string&in repoDir, const string&in branch) {
+// Forget which GitHub repo this map shares to (the repo on GitHub is left untouched).
+void GH_UnlinkRemote(const string&in repoDir) {
+    string cfg = MG_RemoteCfgPath(repoDir);
+    if (IO::FileExists(cfg)) IO::Delete(cfg);
+    string origin = repoDir + "/refs/remotes/origin";
+    if (IO::FolderExists(origin)) IO::DeleteFolder(origin, true);
+    g_ghOwner = "";
+    g_ghRepo = "";
+    g_mgRemoteCacheDir = "";
+    g_ghStatus = "not shared yet";
+    MG_Log("GitHub: unlinked this map from its shared repository");
+}
+
+// Remote-tracking tip (imported MapGit commit sha) — always updated after a fetch/import.
+string GH_OriginTipPath(const string&in repoDir, const string&in branch) {
     return repoDir + "/refs/remotes/origin/" + branch;
 }
 
-// content: "<localSha> <gitSha>"
-void GH_WriteRemoteState(const string&in repoDir, const string&in branch,
-                         const string&in localSha, const string&in gitSha) {
+// Sync bookkeeping: last successfully FF'd or merge-pushed pair.
+string GH_SyncStatePath(const string&in repoDir, const string&in branch) {
+    return repoDir + "/refs/remotes/origin/" + branch + ".sync";
+}
+
+void GH_EnsureOriginDirs(const string&in repoDir) {
     string dir = repoDir + "/refs/remotes";
     if (!IO::FolderExists(dir)) IO::CreateFolder(dir);
     if (!IO::FolderExists(dir + "/origin")) IO::CreateFolder(dir + "/origin");
-    MG_WriteTextFile(GH_RemoteStatePath(repoDir, branch), localSha + " " + gitSha);
+}
+
+void GH_WriteOriginTip(const string&in repoDir, const string&in branch, const string&in localTip) {
+    GH_EnsureOriginDirs(repoDir);
+    MG_WriteTextFile(GH_OriginTipPath(repoDir, branch), localTip);
+}
+
+string GH_OriginTipSha(const string&in repoDir, const string&in branch) {
+    string text = MG_ReadTextFile(GH_OriginTipPath(repoDir, branch)).Replace("\r", "").Replace("\n", "");
+    while (text.Length > 0 && text.SubStr(0, 1) == " ") text = text.SubStr(1);
+    while (text.Length > 0 && text.SubStr(text.Length - 1, 1) == " ") text = text.SubStr(0, text.Length - 1);
+    if (text.Length == 0) return "";
+    // Legacy format was "<localSha> <gitSha>" — tip is the first token.
+    string[] parts = text.Split(" ");
+    return parts[0];
+}
+
+// content: "<localSha> <gitSha>" — only advance after FF or successful merge+push
+void GH_WriteRemoteState(const string&in repoDir, const string&in branch,
+                         const string&in localSha, const string&in gitSha) {
+    GH_EnsureOriginDirs(repoDir);
+    MG_WriteTextFile(GH_SyncStatePath(repoDir, branch), localSha + " " + gitSha);
+    // Keep the origin tip aligned with the sync point when we advance sync.
+    if (localSha.Length > 0) GH_WriteOriginTip(repoDir, branch, localSha);
 }
 
 void GH_ReadRemoteState(const string&in repoDir, const string&in branch,
                         string&out localSha, string&out gitSha) {
     localSha = "";
     gitSha = "";
-    string text = MG_ReadTextFile(GH_RemoteStatePath(repoDir, branch));
-    if (text.Length == 0) return;
+    string text = MG_ReadTextFile(GH_SyncStatePath(repoDir, branch));
+    if (text.Length == 0) {
+        // Migrate legacy tip file that held "<localSha> <gitSha>"
+        text = MG_ReadTextFile(GH_OriginTipPath(repoDir, branch));
+        if (text.Length == 0) return;
+        string[] legacy = text.Split(" ");
+        if (legacy.Length >= 2) {
+            localSha = legacy[0];
+            gitSha = legacy[1];
+            GH_WriteRemoteState(repoDir, branch, localSha, gitSha);
+        }
+        return;
+    }
     string[] parts = text.Split(" ");
     if (parts.Length >= 2) {
         localSha = parts[0];
@@ -254,11 +330,50 @@ void GH_ReadRemoteState(const string&in repoDir, const string&in branch,
     }
 }
 
-string GH_SanitizeRepoName(const string&in nameIn) {
-    string n = nameIn.Replace(" ", "-").Replace(".", "-").Replace("/", "-").Replace("\\", "-")
-                     .Replace(":", "-").Replace("*", "-").Replace("?", "-").Replace("\"", "-")
-                     .Replace("<", "-").Replace(">", "-").Replace("|", "-").Replace("#", "-");
-    return n;
+[Setting name="GitHub repository name prefix"]
+string S_GHRepoPrefix = "tm-map-";
+
+// GitHub allows [A-Za-z0-9._-]; everything else (spaces, $ codes, accents) becomes a single dash.
+string GH_SanitizeRepoName(const string&in nameIn, bool lower = false) {
+    string src = lower ? nameIn.ToLower() : nameIn;
+    string res = "";
+    bool lastDash = true; // also trims leading dashes
+    for (int i = 0; i < src.Length; i++) {
+        uint8 c = src[i];
+        bool ok = (c >= 0x61 && c <= 0x7A) || (c >= 0x30 && c <= 0x39)
+               || (!lower && c >= 0x41 && c <= 0x5A) || (!lower && (c == 0x2E || c == 0x5F));
+        if (ok) {
+            res += src.SubStr(i, 1);
+            lastDash = false;
+        } else if (!lastDash) {
+            res += "-";
+            lastDash = true;
+        }
+    }
+    while (res.Length > 0 && res.SubStr(res.Length - 1, 1) == "-") res = res.SubStr(0, res.Length - 1);
+    return res;
+}
+
+string MG_MapFileStem(CGameCtnChallenge@ map) {
+    string f = map.MapInfo.FileName;
+    f = f.Replace("\\", "/");
+    string[] parts = f.Split("/");
+    string name = parts.Length > 0 ? parts[parts.Length - 1] : f;
+    if (name.ToLower().EndsWith(".map.gbx")) name = name.SubStr(0, name.Length - 8);
+    return name;
+}
+
+// "<prefix><map-name>", e.g. "tm-map-summer-cup-r3". Uses the map title without colour codes,
+// falling back to the saved file name when the title is still the default "Unnamed".
+string GH_DefaultRepoName(CGameCtnChallenge@ map) {
+    string title = map.MapName;
+    string slug = GH_SanitizeRepoName(Text::StripFormatCodes(title), true);
+    if (slug.Length == 0 || slug == "unnamed") slug = GH_SanitizeRepoName(MG_MapFileStem(map), true);
+    if (slug.Length == 0) slug = "untitled";
+    string prefix = GH_SanitizeRepoName(S_GHRepoPrefix, true);
+    string name = prefix.Length > 0 ? prefix + "-" + slug : slug;
+    if (name.Length > 90) name = name.SubStr(0, 90);
+    return name;
 }
 
 // ------------------------- push -------------------------
@@ -290,8 +405,12 @@ void GH_PushWork() {
 
     // remote binding: create the repo on first push, or bind to an existing one
     if (!GH_ReadRemote(repoDir)) {
-        if (g_ghOwner.Length > 0 && g_ghRepo.Length > 0) {
-            // pre-bound via the "existing repository" input
+        if (g_ghBindOwner.Length > 0 && g_ghBindRepo.Length > 0) {
+            // explicitly chosen via the "existing repository" input
+            g_ghOwner = g_ghBindOwner;
+            g_ghRepo = g_ghBindRepo;
+            g_ghBindOwner = "";
+            g_ghBindRepo = "";
             GH_WriteRemote(repoDir);
             MG_Log("push: bound to existing " + g_ghOwner + "/" + g_ghRepo);
         } else {
@@ -299,21 +418,29 @@ void GH_PushWork() {
                 MG_Log("push: client id is a GitHub App (Iv...) — its tokens cannot create repositories; "
                        "use a classic OAuth App or the existing-repository option");
             }
-            string name = GH_SanitizeRepoName(g_ghRepoName);
-            if (name.Length == 0) { MG_Log("push: enter a repository name first"); g_ghBusy = false; g_ghStatus = "need repo name"; return; }
-            MG_Log("push: creating repository '" + name + "' (" + (g_ghPrivate ? "private" : "public") + ")...");
+            string baseName = (S_DevTools && g_ghRepoName.Length > 0) ? GH_SanitizeRepoName(g_ghRepoName) : GH_DefaultRepoName(map);
+            if (baseName.Length == 0) { MG_Log("push: enter a repository name first"); g_ghBusy = false; g_ghStatus = "need repo name"; return; }
             string mapName = map.MapName; // wstring -> string (no Replace on wstring)
-            string body = "{\"name\":\"" + name + "\",\"private\":" + (g_ghPrivate ? "true" : "false") +
-                ",\"description\":\"MapGit repository for " + mapName.Replace("\"", "'") +
-                "\",\"has_issues\":false,\"has_wiki\":false}";
-            Json::Value@ created = GH_Api("POST", "https://api.github.com/user/repos", body);
+            string desc = Text::StripFormatCodes(mapName).Replace("\"", "'").Replace("\\", "/");
+            Json::Value@ created = null;
+            string name = baseName;
+            for (int attempt = 1; attempt <= 5 && created is null; attempt++) {
+                name = attempt == 1 ? baseName : baseName + "-" + attempt;
+                MG_Log("push: creating repository '" + name + "' (" + (g_ghPrivate ? "private" : "public") + ")...");
+                string body = "{\"name\":\"" + name + "\",\"private\":" + (g_ghPrivate ? "true" : "false") +
+                    ",\"description\":\"Trackmania map '" + desc + "' (MapGit)\",\"has_issues\":false,\"has_wiki\":false}";
+                @created = GH_Api("POST", "https://api.github.com/user/repos", body);
+                if (created is null && g_ghLastCode != 422) break; // 422 = name already used
+                if (created is null) MG_Log("push: '" + name + "' already exists on your account — trying another name");
+            }
             if (created is null) {
-                g_ghStatus = "repo creation failed (name taken?)";
+                g_ghStatus = "repo creation failed";
                 g_ghBusy = false;
                 return;
             }
             g_ghOwner = g_ghLogin;
             g_ghRepo = name;
+            g_ghRepoName = "";
             GH_WriteRemote(repoDir);
             MG_Log("push: created " + g_ghOwner + "/" + g_ghRepo);
         }
@@ -380,10 +507,34 @@ void GH_PushWork() {
         if (gitManSha.Length == 0) { g_ghBusy = false; g_ghStatus = "manifest upload failed"; return; }
         yield();
 
+        // extras: clip fingerprint + custom files (optional; older versions have none)
+        string extraEntries = "";
+        string mediaFp = MG_ReadCommitExtra(repoDir, localSha, "media");
+        string customList = MG_ReadCommitExtra(repoDir, localSha, "items");
+        if (mediaFp.Length > 0 || customList.Length > 0) {
+            string extrasPath = IO::FromStorageFolder("push-extras.json");
+            MG_WriteTextFile(extrasPath, "{\"media\":" + MG_JsonStr(mediaFp) + ",\"items\":" + MG_JsonStr(customList) + "}");
+            g_ghBlobCache.Delete(extrasPath);
+            string gitExtrasSha = GH_UploadFileBlob(extrasPath);
+            if (gitExtrasSha.Length == 0) { g_ghBusy = false; g_ghStatus = "upload failed"; return; }
+            extraEntries += ",{\"path\":\"extras.json\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"" + gitExtrasSha + "\"}";
+            array<MGCustomFile@>@ files = MG_ParseCustomFiles(customList);
+            for (uint f = 0; f < files.Length; f++) {
+                string src = repoDir + "/objects/items/" + files[f].sha + ".gbx";
+                if (!IO::FileExists(src)) continue;
+                string gitItemSha = GH_UploadFileBlob(src);
+                if (gitItemSha.Length == 0) { g_ghBusy = false; g_ghStatus = "custom item upload failed"; return; }
+                extraEntries += ",{\"path\":" + MG_JsonStr("items/" + files[f].rel) +
+                                ",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"" + gitItemSha + "\"}";
+                yield();
+            }
+        }
+
         // tree
         string treeBody = "{\"tree\":[" +
             "{\"path\":\"map.Map.Gbx\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"" + gitBlobSha + "\"}," +
-            "{\"path\":\"manifest.json\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"" + gitManSha + "\"}]}";
+            "{\"path\":\"manifest.json\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"" + gitManSha + "\"}" +
+            extraEntries + "]}";
         Json::Value@ tree = GH_Api("POST", GH_ApiUrl("/git/trees"), treeBody);
         if (tree is null) { g_ghBusy = false; g_ghStatus = "tree creation failed"; return; }
         string gitTree = tree["sha"];
@@ -401,14 +552,25 @@ void GH_PushWork() {
         MG_Log("push: " + MG_Short(localSha) + " -> git " + MG_Short(gitTip));
     }
 
-    // ref update (create on 404, else force-move)
+    // ref update: create on 404; otherwise prefer non-force when remote tip is our known sync tip
     Json::Value@ existing = GH_Api("GET", GH_ApiUrl("/git/refs/heads/" + branch), "");
     if (g_ghLastCode == 404) {
         string refBody = "{\"ref\":\"refs/heads/" + branch + "\",\"sha\":\"" + gitTip + "\"}";
         Json::Value@ made = GH_Api("POST", GH_ApiUrl("/git/refs"), refBody);
         if (made is null) { g_ghBusy = false; g_ghStatus = "ref creation failed"; return; }
     } else if (existing !is null) {
-        string refBody = "{\"sha\":\"" + gitTip + "\",\"force\":true}";
+        string remoteTipNow = existing["object"]["sha"];
+        if (lastGit.Length > 0 && remoteTipNow != lastGit) {
+            // Teammate pushed since we last synced — refuse rather than clobber.
+            MG_Log("push: remote moved to " + MG_Short(remoteTipNow) + " (last synced " + MG_Short(lastGit) +
+                   ") — Update/combine first");
+            g_ghStatus = "remote has new changes — Update first";
+            UI::ShowNotification("MapGit", "Your collaborators shared new changes — Update before Share.");
+            g_ghBusy = false;
+            return;
+        }
+        bool useForce = !incremental; // only force on full re-push of rewritten history
+        string refBody = "{\"sha\":\"" + gitTip + "\",\"force\":" + (useForce ? "true" : "false") + "}";
         Json::Value@ moved = GH_Api("PATCH", GH_ApiUrl("/git/refs/heads/" + branch), refBody);
         if (moved is null) { g_ghBusy = false; g_ghStatus = "ref update failed"; return; }
     } else {
@@ -470,16 +632,20 @@ void GH_BindExistingCoro() {
     string input = g_ghExistingRepo.Replace("\\", "/").Replace("https://github.com/", "").Replace(" ", "");
     // accept "owner/name", "github.com/owner/name", or a full URL tail
     string[] parts = input.Split("/");
+    g_ghBindOwner = "";
+    g_ghBindRepo = "";
     if (parts.Length >= 2) {
-        g_ghOwner = parts[parts.Length - 2];
-        g_ghRepo = parts[parts.Length - 1];
+        g_ghBindOwner = parts[parts.Length - 2];
+        g_ghBindRepo = parts[parts.Length - 1];
     }
-    if (g_ghOwner.Length == 0 || g_ghRepo.Length == 0 || g_ghOwner == "github.com") {
+    if (g_ghBindOwner.Length == 0 || g_ghBindRepo.Length == 0 || g_ghBindOwner == "github.com") {
         MG_Log("push: enter the repository as owner/name (e.g. yourname/your-map)");
+        g_ghBindOwner = "";
+        g_ghBindRepo = "";
         g_ghBusy = false;
         return;
     }
-    MG_Log("push: using existing repository " + g_ghOwner + "/" + g_ghRepo);
+    MG_Log("push: using existing repository " + g_ghBindOwner + "/" + g_ghBindRepo);
     g_ghBusy = false;
     GH_PushWork();
 }
@@ -535,10 +701,21 @@ bool GH_DownloadBlob(const string&in gitBlobSha, const string&in expectedSha256,
     return true;
 }
 
+// Small text blobs (extras.json); "" on failure.
+string GH_FetchBlobText(const string&in gitBlobSha) {
+    Json::Value@ b = GH_Api("GET", GH_ApiUrl("/git/blobs/" + gitBlobSha), "");
+    if (b is null) return "";
+    string content = b["content"];
+    MemoryBuffer@ buf = MemoryBuffer();
+    buf.WriteFromBase64(content.Replace("\n", ""));
+    buf.Seek(0);
+    return buf.ReadString(buf.GetSize());
+}
+
 // Imports one remote commit into the local store. Returns the new local sha ("" to skip).
 // Message format (fixed slices): "mapgit:v1 manifest:<64> blob:<64>\n\n<orig> (MapGit commit <10>)"
-string GH_ImportRemoteCommit(const string&in msg, const string&in authorName, const string&in isoTime,
-                             const string&in parentLocal) {
+string GH_ImportRemoteCommit(const string&in repoDir, const string&in msg, const string&in authorName,
+                             const string&in isoTime, const string&in parentLocal) {
     if (!msg.StartsWith("mapgit:v1 manifest:")) return ""; // bootstrap/foreign commit — skip
     // "mapgit:v1 manifest:" (19) + sha64 + " blob:" (6) + sha64 + "\n\n" + orig + " (MapGit commit xxxxxxxxxx)" (27)
     if (msg.SubStr(83, 6) != " blob:") {
@@ -550,23 +727,29 @@ string GH_ImportRemoteCommit(const string&in msg, const string&in authorName, co
     string origMsg = msg.SubStr(155, int(msg.Length) - 155 - 27);
     int64 time = GH_ParseIsoTime(isoTime);
 
+    // the commit's files (recursive: custom items live under items/)
+    Json::Value@ c = GH_Api("GET", GH_ApiUrl("/git/commits/" + g_ghCurImportSha), "");
+    if (c is null) return "";
+    string treeSha = c["tree"]["sha"];
+    Json::Value@ tree = GH_Api("GET", GH_ApiUrl("/git/trees/" + treeSha + "?recursive=1"), "");
+    if (tree is null) return "";
+    string gitMapSha = "", gitManSha = "", gitExtrasSha = "";
+    dictionary gitByPath;
+    Json::Value@ entries = tree["tree"];
+    for (uint i = 0; i < entries.Length; i++) {
+        string path = entries[i]["path"];
+        string type = entries[i]["type"];
+        if (type != "blob") continue;
+        string sha = entries[i]["sha"];
+        gitByPath.Set(path, sha);
+        if (path == "map.Map.Gbx") gitMapSha = sha;
+        if (path == "manifest.json") gitManSha = sha;
+        if (path == "extras.json") gitExtrasSha = sha;
+    }
+
     // objects: skip downloads if we already have them (shared history)
-    string repoDir = MG_ReposRoot() + "/" + MG_RepoIdFor(MG_MapFileOf(GetMap()));
     if (!IO::FileExists(repoDir + "/objects/blobs/" + blobSha + ".gbx") ||
         !IO::FileExists(repoDir + "/objects/manifests/" + manifestSha + ".json")) {
-        // find the file blobs in the commit's tree
-        Json::Value@ c = GH_Api("GET", GH_ApiUrl("/git/commits/" + g_ghCurImportSha), "");
-        if (c is null) return "";
-        string treeSha = c["tree"]["sha"];
-        Json::Value@ tree = GH_Api("GET", GH_ApiUrl("/git/trees/" + treeSha), "");
-        if (tree is null) return "";
-        string gitMapSha = "", gitManSha = "";
-        Json::Value@ entries = tree["tree"];
-        for (uint i = 0; i < entries.Length; i++) {
-            string path = entries[i]["path"];
-            if (path == "map.Map.Gbx") gitMapSha = entries[i]["sha"];
-            if (path == "manifest.json") gitManSha = entries[i]["sha"];
-        }
         if (gitMapSha.Length == 0 || gitManSha.Length == 0) {
             MG_Log("pull: commit tree missing MapGit files; skipping");
             return "";
@@ -579,10 +762,34 @@ string GH_ImportRemoteCommit(const string&in msg, const string&in authorName, co
         }
     }
 
+    // extras: clip fingerprint + custom item/block files
+    string mediaFp = "", customList = "";
+    if (gitExtrasSha.Length > 0) {
+        Json::Value@ ex = null;
+        try { @ex = Json::Parse(GH_FetchBlobText(gitExtrasSha)); } catch { }
+        if (ex !is null && ex.GetType() == Json::Type::Object) {
+            if (ex.HasKey("media")) mediaFp = string(ex["media"]);
+            if (ex.HasKey("items")) customList = string(ex["items"]);
+        }
+        array<MGCustomFile@>@ files = MG_ParseCustomFiles(customList);
+        for (uint f = 0; f < files.Length; f++) {
+            string dest = repoDir + "/objects/items/" + files[f].sha + ".gbx";
+            if (IO::FileExists(dest)) continue;
+            string gitItemSha;
+            if (!gitByPath.Get("items/" + files[f].rel, gitItemSha)) continue;
+            IO::CreateFolder(repoDir + "/objects/items");
+            if (!GH_DownloadBlob(gitItemSha, files[f].sha, dest)) {
+                MG_Log("pull: custom file '" + files[f].rel + "' failed to download");
+            }
+            yield();
+        }
+    }
+
     // local commit object (same canonical shape as local commits)
     string commitJson = "{\"parents\":\"" + parentLocal + "\",\"manifest\":\"" + manifestSha +
         "\",\"blob\":\"" + blobSha + "\",\"author\":\"" + authorName + "\",\"message\":" + MG_JsonStr(origMsg) +
         ",\"time\":" + time +
+        (gitExtrasSha.Length > 0 ? ",\"media\":" + MG_JsonStr(mediaFp) + ",\"items\":" + MG_JsonStr(customList) : "") +
         ",\"header\":\"mapgit:v1 manifest:" + manifestSha + " blob:" + blobSha + "\"}";
     string localSha = Crypto::Sha256(commitJson);
     MG_WriteTextFile(repoDir + "/commits/" + localSha + ".json", commitJson);
@@ -644,8 +851,9 @@ void GH_PullWork() {
         toImport.InsertLast(sha);
     }
     if (!foundBase) {
-        MG_Log("pull: remote history diverged from the last synced commit — merge is Phase D; refusing");
-        g_ghStatus = "diverged (merge pending)";
+        MG_Log("pull: remote history does not share a sync point with this PC — cannot combine automatically");
+        g_ghStatus = "histories don't share a sync point — re-bind or Share a fresh first version";
+        UI::ShowNotification("MapGit", "Cannot Update: remote history was rewritten. Re-bind the repository or Share a fresh first version.");
         g_ghBusy = false;
         return;
     }
@@ -668,7 +876,7 @@ void GH_PullWork() {
         try { authorName = e["author"]["name"]; } catch { }
         if (authorName.Length == 0) authorName = g_ghLogin;
         string isoTime = e["committer"]["date"];
-        string newLocal = GH_ImportRemoteCommit(msg, authorName, isoTime, prevLocal);
+        string newLocal = GH_ImportRemoteCommit(repoDir, msg, authorName, isoTime, prevLocal);
         if (newLocal.Length == 0) {
             if (!msg.StartsWith("mapgit:v1")) { continue; } // bootstrap/README commit
             MG_Log("pull: import failed at " + MG_Short(g_ghCurImportSha));
@@ -681,13 +889,15 @@ void GH_PullWork() {
         yield();
     }
 
-    // fast-forward the branch when it has no unpushed local commits
-    if (localTip == lastLocal) {
+    // Always persist the fetched remote tip (even if we still need to merge).
+    GH_WriteOriginTip(repoDir, branch, prevLocal);
+
+    // Fast-forward when the local tip is still at the last synced commit.
+    if (localTip == lastLocal || localTip.Length == 0) {
         MG_WriteTextFile(repoDir + "/refs/heads/" + branch, prevLocal);
         g_mgRepoTip = prevLocal;
         MG_Log("pull: fast-forwarded '" + branch + "' to " + MG_Short(prevLocal));
 
-        // if the open map is clean, restore the new tip and reopen (like checkout)
         MG_Log("pull: checking the working map before restoring...");
         MGManifest@ m = MG_BuildManifest(map);
         string tmp = IO::FromStorageFolder("pull-manifest.json");
@@ -704,6 +914,7 @@ void GH_PullWork() {
             string mapPath;
             if (mapFid !is null) { mapPath = mapFid.FullFileName; }
             else { mapPath = IO::FromUserGameFolder(MG_MapFileOf(map)); }
+            MG_InstallCustomFilesFor(repoDir, prevLocal); // loaded when the map reopens
             try {
                 MG_CopyFile(repoDir + "/objects/blobs/" + tb + ".gbx", mapPath);
             } catch {
@@ -726,16 +937,23 @@ void GH_PullWork() {
             }
             g_ghStatus = "pulled " + imported + " commits (" + branch + ")";
         }
-    } else {
-        g_ghStatus = "imported " + imported + " commits; local branch has unpushed commits — branch head kept (merge: Phase D)";
-        MG_Log("pull: " + g_ghStatus);
+        // Sync markers advance only after a successful FF absorb.
+        GH_WriteRemoteState(repoDir, branch, prevLocal, remoteGit);
+        g_mgRemoteSentence = "";
+        g_mgNotifiedRemoteGit = "";
+        MG_Log("pull: done — " + g_ghStatus);
+        g_ghBusy = false;
+        return;
     }
 
-    GH_WriteRemoteState(repoDir, branch, prevLocal, remoteGit);
-    g_mgRemoteSentence = "";   // we just brought the team's changes in
-    g_mgNotifiedRemoteGit = "";
-    MG_Log("pull: done — " + g_ghStatus);
+    // Both sides moved: start a tip-based merge (origin tip = prevLocal).
+    // Do NOT advance sync state until merge (+ optional push) succeeds.
+    g_ghStatus = "imported " + imported + " commits — combining with your local changes...";
+    MG_Log("pull: " + g_ghStatus);
     g_ghBusy = false;
+    string originLabel = "origin/" + branch;
+    bool pushAfter = g_mgMergePushAfter;
+    MG_MergeFromTips(repoDir, localTip, prevLocal, originLabel, branch, pushAfter, remoteGit);
 }
 
 // ------------------------- auth section (shared by panel + dev tab) -------------------------
@@ -744,22 +962,32 @@ void GH_PullWork() {
 // built-in app id covers normal users), just connect/log out + the device link.
 void RenderGitHubAuthSection() {
     if (S_GHToken.Length == 0 && g_ghToken.Length == 0) {
-        UI::BeginDisabled(g_ghBusy);
-        if (UI::Button(T("Connect to GitHub", "Log in with GitHub"))) GH_StartDeviceFlow();
-        UI::EndDisabled();
-        UI::SameLine();
-        UI::TextDisabled("required once to share maps with others");
         if (g_ghUserCode.Length > 0) {
-            UI::Text("\\$fe1 code: " + g_ghUserCode + "  (copied to clipboard)");
+            // Device flow in progress: walk the user through the browser step.
+            UI::Text("1. Your code is \\$fe1" + g_ghUserCode + "\\$z (already copied).");
+            UI::SameLine();
+            if (UI::Button(Icons::Clipboard + " Copy again")) IO::SetClipboard(g_ghUserCode);
             string linkUrl = (g_ghUriComplete.Length > 0) ? g_ghUriComplete : g_ghUri;
-            if (g_ghUriComplete.Length > 0) {
-                UI::TextLinkOpenURL("\\$0f0\\$iOpen github.com/login/device (code pre-filled)", linkUrl);
-            } else {
-                UI::TextLinkOpenURL("\\$0f0\\$iOpen " + g_ghUri, linkUrl);
-            }
+            UI::AlignTextToFramePadding();
+            UI::Text("2.");
+            UI::SameLine();
+            if (UI::Button(Icons::ExternalLink + " Open GitHub in your browser")) OpenBrowserURL(linkUrl);
+            UI::SameLine();
+            UI::TextDisabled(g_ghUriComplete.Length > 0 ? "(the code is filled in for you)" : "(paste the code there)");
+            UI::Text("3. Press \\$8f0Authorize\\$z on GitHub, then come back here.");
+            UI::TextDisabled(Icons::Refresh + " Waiting for GitHub... MapGit notices automatically.");
+        } else {
+            UI::BeginDisabled(g_ghBusy);
+            if (UI::Button(Icons::Github + " " + T("Connect to GitHub", "Log in with GitHub"))) GH_StartDeviceFlow();
+            UI::EndDisabled();
+            UI::SameLine();
+            UI::TextDisabled("needed once, to share maps with others");
+            UI::TextDisabled("No account?");
+            UI::SameLine();
+            UI::TextLinkOpenURL("\\$0cfCreate a free GitHub account", "https://github.com/signup");
         }
     } else {
-        UI::Text("\\$8f0" + "GitHub: " + (g_ghLogin.Length > 0 ? g_ghLogin : "connected"));
+        UI::Text("\\$8f0" + Icons::Check + "\\$z Connected to GitHub as \\$fff" + (g_ghLogin.Length > 0 ? g_ghLogin : "(checking...)"));
         UI::SameLine();
         if (UI::Button("Log out")) {
             g_ghToken = "";
@@ -774,68 +1002,68 @@ void RenderGitHubAuthSection() {
 
 // ------------------------- UI -------------------------
 
-void RenderGitHubTab() {
-    UI::Text("GitHub sync (device-flow auth, real git repositories)");
-    UI::Separator();
+void RenderGitHubPage() {
+    UI::SeparatorText("Account");
+    RenderGitHubAuthSection();
+    UI::TextDisabled("Your login is saved on this PC in PluginStorage/tm-mapgit/auth.json (not encrypted).");
+    UI::TextDisabled("You can revoke it any time at github.com/settings/applications.");
 
-    bool changed;
-    UI::SetNextItemWidth(300);
-    S_GHClientId = UI::InputText("##gh-client", S_GHClientId, changed);
-    UI::SameLine();
-    UI::TextDisabled("client id override (empty = built-in)");
+    UI::SeparatorText("Shared map");
+    RenderGitHubRemoteSection();
 
-    if (g_ghToken.Length == 0) {
-        UI::BeginDisabled(g_ghBusy);
-        if (UI::Button("Log in with GitHub")) GH_StartDeviceFlow();
-        UI::EndDisabled();
-        if (g_ghUserCode.Length > 0) {
-            UI::Text("\\$fe1 code: " + g_ghUserCode + "  (copied to clipboard)");
-            string linkUrl = (g_ghUriComplete.Length > 0) ? g_ghUriComplete : g_ghUri;
-            if (g_ghUriComplete.Length > 0) {
-                UI::TextLinkOpenURL("\\$0f0\\$iOpen github.com/login/device (code pre-filled)", linkUrl);
-            } else {
-                UI::TextLinkOpenURL("\\$0f0\\$iOpen " + g_ghUri, linkUrl);
-            }
-        }
-    } else {
-        UI::Text("logged in as " + (g_ghLogin.Length > 0 ? g_ghLogin : "(unknown — will verify on upload)"));
-        UI::SameLine();
-        if (UI::Button("Log out")) {
-            g_ghToken = "";
-            g_ghLogin = "";
-            S_GHToken = ""; // clears any legacy value too
-            GH_SaveToken();
-            g_ghStatus = "not connected";
-            MG_Log("GitHub: token cleared — you can log in again");
-        }
-    }
+    UI::SeparatorText("Sync activity");
+    RenderActivityLog();
+}
 
-    UI::Separator();
+void RenderGitHubRemoteSection() {
     CGameCtnChallenge@ map = GetMap();
     if (map is null) {
-        UI::Text("Open the map editor to push.");
+        UI::TextDisabled("Open a map in the editor to see where it's shared.");
         return;
     }
 
     string repoDir = MG_ReposRoot() + "/" + MG_RepoIdFor(MG_MapFileOf(map));
     bool bound = GH_ReadRemote(repoDir);
     if (bound) {
-        UI::Text("Remote: " + g_ghOwner + "/" + g_ghRepo + "  (" + T("version line", "branch") + " " + MG_CurrentBranch(repoDir) + ")");
+        UI::Text("This map is shared at " + g_ghOwner + "/" + g_ghRepo);
+        UI::SameLine();
+        UI::TextLinkOpenURL("\\$0cf" + Icons::ExternalLink + " Open on GitHub", "https://github.com/" + g_ghOwner + "/" + g_ghRepo);
+        UI::BeginDisabled(g_ghBusy || g_mgRepoBusy || g_mgMergeActive);
+        if (!g_ghConfirmUnlink) {
+            if (UI::Button("Unlink from this repository")) g_ghConfirmUnlink = true;
+        } else {
+            if (UI::Button("\\$f84" + "Yes, unlink")) {
+                GH_UnlinkRemote(repoDir);
+                g_ghConfirmUnlink = false;
+            }
+            UI::SameLine();
+            if (UI::Button("Keep it")) g_ghConfirmUnlink = false;
+            UI::SameLine();
+            UI::TextDisabled("Your next Share creates a new repository. Nothing is deleted on GitHub.");
+        }
+        UI::EndDisabled();
+        if (!S_DevTools) return;
+        UI::TextDisabled(T("Version line", "Branch") + ": " + MG_CurrentBranch(repoDir));
         UI::BeginDisabled(g_ghBusy || g_ghToken.Length == 0);
         if (UI::Button(T("Upload", "Push") + " " + T("current version line", "branch"))) GH_PushCoro();
         UI::SameLine();
         if (UI::Button(T("Download", "Pull") + " " + T("current version line", "branch"))) GH_PullCoro();
         UI::EndDisabled();
     } else {
-        UI::Text("First upload — creates a repository for this map:");
-        if (g_ghRepoName.Length == 0) {
-            g_ghRepoName = GH_SanitizeRepoName(map.MapName);
+        if (MG_MapIsSaved(map)) {
+            UI::TextDisabled("Not shared yet. Share on Home creates a private repository called " + GH_DefaultRepoName(map) + ".");
+        } else {
+            UI::TextDisabled("Not shared yet. Save the map first, then Share on Home.");
         }
+        if (!S_DevTools) return;
+        bool changed;
+        UI::Text("First upload — creates a repository for this map:");
         UI::SetNextItemWidth(280);
         g_ghRepoName = UI::InputText("##gh-repo-name", g_ghRepoName, changed);
         UI::SameLine();
         g_ghPrivate = UI::Checkbox("Private", g_ghPrivate);
-        UI::BeginDisabled(g_ghBusy || g_ghToken.Length == 0 || g_ghRepoName.Length == 0);
+        UI::TextDisabled("Leave empty to use " + GH_DefaultRepoName(map));
+        UI::BeginDisabled(g_ghBusy || g_ghToken.Length == 0 || !MG_MapIsSaved(map));
         if (UI::Button(T("Create repository & upload", "Create repository & push"))) GH_PushCoro();
         UI::EndDisabled();
 
@@ -846,12 +1074,6 @@ void RenderGitHubTab() {
         UI::BeginDisabled(g_ghBusy || g_ghToken.Length == 0);
         if (UI::Button(T("Bind & upload", "Bind & push"))) startnew(GH_BindExistingCoro);
         UI::EndDisabled();
+        UI::TextDisabled("Remote repos contain map.Map.Gbx + manifest.json per commit — cloneable with git.");
     }
-
-    if (g_ghStatus.Length > 0) {
-        UI::Separator();
-        UI::Text(g_ghStatus);
-    }
-    UI::Separator();
-    UI::TextDisabled("Remote repos contain map.Map.Gbx + manifest.json per commit — cloneable with git.");
 }

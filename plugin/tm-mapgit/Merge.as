@@ -30,6 +30,18 @@ MGBlock MG_BlockFromJson(Json::Value@ blk) {
         b.freeRot = vec3(float(blk["freeRotation"]["x"]), float(blk["freeRotation"]["y"]), float(blk["freeRotation"]["z"]));
     }
     b.hasSkin = bool(blk["hasSkin"]);
+    b.hasSkinFile = false;
+    b.hasSkinUrl = false;
+    b.skinFile = "";
+    b.skinUrl = "";
+    if (blk.HasKey("skinFile") && blk["skinFile"].GetType() != Json::Type::Null) {
+        b.skinFile = blk["skinFile"];
+        b.hasSkinFile = b.skinFile.Length > 0;
+    }
+    if (blk.HasKey("skinUrl") && blk["skinUrl"].GetType() != Json::Type::Null) {
+        b.skinUrl = blk["skinUrl"];
+        b.hasSkinUrl = b.skinUrl.Length > 0;
+    }
     b.hasWaypointProps = bool(blk["hasWaypointProps"]);
     return b;
 }
@@ -87,6 +99,15 @@ MGManifest@ MG_ReadManifest(const string&in path) {
             m.items.InsertLast(MG_ItemFromJson(items[i]));
         }
         m.embeddedEntryCount = int(j["embedded"]["entryCount"]);
+        if (j["embedded"].HasKey("entries")) {
+            Json::Value@ ents = j["embedded"]["entries"];
+            for (uint i = 0; i < ents.Length; i++) {
+                MGEmbeddedEntry e;
+                e.name = ents[i]["name"];
+                e.fingerprint = ents[i].HasKey("fingerprint") ? string(ents[i]["fingerprint"]) : "";
+                m.embeddedEntries.InsertLast(e);
+            }
+        }
         return m;
     } catch {
         MG_Log("merge: manifest parse failed: " + getExceptionInfo());
@@ -153,19 +174,27 @@ class MGItemIndex {
 // ------------------------- conflicts -------------------------
 
 class MGMergeConflict {
-    int kind;        // 0 AddAdd, 1 ModifyModify, 2 ModifyDelete, 3 DeleteModify, 4 Metadata, 5 Embedded
-    string section;  // "block" / "item" / "mapInfo" / "embedded"
+    int kind;        // 0 AddAdd, 1 ModifyModify, 2 ModifyDelete, 3 DeleteModify, 4 Metadata, 5 Embedded, 6 StartLine
+    string section;  // "block" / "item" / "mapInfo" / "embedded" (for StartLine: theirs' kind)
     string key;
+    string oursSection;    // StartLine only: ours may be a block while theirs is an item
+    string oursKey;
     string oursSummary;
     string theirsSummary;
     string baseSummary;
     MGBlock@ theirsBlock;  // for block conflicts
     MGItem@ theirsItem;    // for item conflicts
+    MGBlock@ oursBlock;
+    MGItem@ oursItem;
     int resolution;        // 0 unresolved, 1 ours, 2 theirs, 3 both, 4 none
     vec3 oursPos;          // world position for the camera jump + green wireframe
     bool hasOursPos;
-    vec3 theirsPos;        // world position for the camera jump + red ghost wireframe
+    vec3 theirsPos;        // world position for the camera jump + red ghost / model
     bool hasTheirsPos;
+    bool previewPlaced;    // real ghost/item model was placed for theirs
+    bool previewFallback;  // model missing — wireframe only
+    CGameCtnBlock@ previewBlock;
+    CGameCtnAnchoredObject@ previewItem;
 }
 
 string MG_KindName(int kind) {
@@ -174,121 +203,805 @@ string MG_KindName(int kind) {
     if (kind == 2) return "modify/delete";
     if (kind == 3) return "delete/modify";
     if (kind == 4) return "metadata";
+    if (kind == 6) return "start line";
+    if (kind == 7) return "mediatracker";
     return "embedded";
+}
+
+// ------------------------- single start line -------------------------
+// A map may only have one start (or one multilap start/finish). Each side can move
+// it to a different spot without any per-cell conflict, so the merge checks it.
+
+dictionary g_mgStartCache;
+
+bool MG_IsStartBlockName(const string&in name) {
+    bool v = false;
+    if (g_mgStartCache.Get("b:" + name, v)) return v;
+    CGameCtnBlockInfo@ info = MG_ResolveBlockInfo(name);
+    v = info !is null && (info.WaypointType == CGameCtnBlockInfo::EWayPointType::Start ||
+                          info.WaypointType == CGameCtnBlockInfo::EWayPointType::StartFinish);
+    g_mgStartCache.Set("b:" + name, v);
+    return v;
+}
+
+bool MG_IsStartItemModel(const string&in name) {
+    bool v = false;
+    if (g_mgStartCache.Get("i:" + name, v)) return v;
+    CGameCtnChallenge@ map = GetMap();
+    CGameItemModel@ model = null;
+    if (map !is null) @model = MG_FindItemModel(map, name);
+    v = model !is null && (model.WaypointType == CGameItemModel::EnumWaypointType::Start ||
+                           model.WaypointType == CGameItemModel::EnumWaypointType::StartFinish);
+    g_mgStartCache.Set("i:" + name, v);
+    return v;
+}
+
+bool MG_ConflictHasStart(MGMergeConflict@ c) {
+    if (c.kind == 6) return true;
+    if (c.oursBlock !is null && MG_IsStartBlockName(c.oursBlock.name)) return true;
+    if (c.theirsBlock !is null && MG_IsStartBlockName(c.theirsBlock.name)) return true;
+    if (c.oursItem !is null && MG_IsStartItemModel(c.oursItem.itemModel)) return true;
+    if (c.theirsItem !is null && MG_IsStartItemModel(c.theirsItem.itemModel)) return true;
+    return false;
+}
+
+int MG_CountStarts(MGManifest@ m) {
+    int n = 0;
+    for (uint i = 0; i < m.blocks.Length; i++) if (MG_IsStartBlockName(m.blocks[i].name)) n++;
+    for (uint i = 0; i < m.items.Length; i++) if (MG_IsStartItemModel(m.items[i].itemModel)) n++;
+    return n;
+}
+
+// Runs after MG_RunMerge. If the clean result holds a start from each side, theirs is
+// held back and the player picks which one the map keeps.
+int g_mgOursStartCount = 0;
+
+void MG_EnforceSingleStart(MGManifest@ oursMan) {
+    g_mgOursStartCount = MG_CountStarts(oursMan);
+    MGBlockIndex@ oB = MGBlockIndex(oursMan.blocks);
+    MGItemIndex@ oI = MGItemIndex(oursMan.items);
+    MGBlock@ oursStartB = null;
+    MGItem@ oursStartI = null;
+    array<MGBlock@> theirsStartsB;
+    array<MGItem@> theirsStartsI;
+    for (uint i = 0; i < g_mgMergedClean.blocks.Length; i++) {
+        MGBlock@ b = g_mgMergedClean.blocks[i];
+        if (!MG_IsStartBlockName(b.name)) continue;
+        int oi = oB.IndexOf(b.key);
+        bool fromOurs = oi >= 0 && oB.src[oi].contentJson == b.contentJson;
+        if (fromOurs) { if (oursStartB is null) @oursStartB = b; }
+        else theirsStartsB.InsertLast(b);
+    }
+    for (uint i = 0; i < g_mgMergedClean.items.Length; i++) {
+        MGItem@ it = g_mgMergedClean.items[i];
+        if (!MG_IsStartItemModel(it.itemModel)) continue;
+        int oi = oI.IndexOf(it.key);
+        bool fromOurs = oi >= 0 && oI.src[oi].contentJson == it.contentJson;
+        if (fromOurs) { if (oursStartI is null) @oursStartI = it; }
+        else theirsStartsI.InsertLast(it);
+    }
+    bool oursHas = oursStartB !is null || oursStartI !is null;
+    bool theirsHas = theirsStartsB.Length > 0 || theirsStartsI.Length > 0;
+    if (!oursHas || !theirsHas) return;
+
+    MGMergeConflict@ c = MGMergeConflict();
+    c.kind = 6;
+    if (oursStartB !is null) {
+        c.oursSection = "block"; c.oursKey = oursStartB.key; c.oursSummary = oursStartB.name;
+        @c.oursBlock = oursStartB; c.oursPos = MG_BlockWorldPos(oursStartB);
+    } else {
+        c.oursSection = "item"; c.oursKey = oursStartI.key; c.oursSummary = oursStartI.itemModel;
+        @c.oursItem = oursStartI; c.oursPos = MG_ItemWorldPos(oursStartI);
+    }
+    c.hasOursPos = true;
+    if (theirsStartsB.Length > 0) {
+        MGBlock@ tb = theirsStartsB[0];
+        c.section = "block"; c.key = tb.key; c.theirsSummary = tb.name;
+        @c.theirsBlock = tb; c.theirsPos = MG_BlockWorldPos(tb);
+    } else {
+        MGItem@ ti = theirsStartsI[0];
+        c.section = "item"; c.key = ti.key; c.theirsSummary = ti.itemModel;
+        @c.theirsItem = ti; c.theirsPos = MG_ItemWorldPos(ti);
+    }
+    c.hasTheirsPos = true;
+
+    // Hold every incoming start back; only the one the player picks is added.
+    for (int i = int(g_mgMergedClean.blocks.Length) - 1; i >= 0; i--) {
+        for (uint j = 0; j < theirsStartsB.Length; j++) {
+            if (g_mgMergedClean.blocks[i] is theirsStartsB[j]) { g_mgMergedClean.blocks.RemoveAt(i); break; }
+        }
+    }
+    for (int i = int(g_mgMergedClean.items.Length) - 1; i >= 0; i--) {
+        for (uint j = 0; j < theirsStartsI.Length; j++) {
+            if (g_mgMergedClean.items[i] is theirsStartsI[j]) { g_mgMergedClean.items.RemoveAt(i); break; }
+        }
+    }
+    g_mgConflicts.InsertLast(c);
+    MG_Log("merge: both sides have a start line — asking which one to keep");
 }
 
 // ------------------------- conflict world positions -------------------------
 
-// Vertical offset between coord-space (cy*8) and the camera/render space.
-// Default = the Stadium2020 7-cell base; calibrated at merge time against a
-// live block's MakeBlockSpec position (the proven-bound exact source).
-float g_mgWorldBaseY = 56.0;
+// World-space Y of the floor of cell y=0 (world y = cy*8 + this). Stadium2020: -64.
+float g_mgGridWorldBaseY = -64.0;
+// E++ keeps free-block positions in a space shifted up from the file/world position
+// (the map's "macroblock" height offset). Stadium2020: +56.
+float g_mgFreeMemOffsetY = 56.0;
+
+// Game-side coord -> world conversion (bottom-min corner of the cell), via the
+// editor's ManiaScript API so custom map bases are honoured.
+bool MG_CoordFloorWorld(int cx, int cy, int cz, vec3 &out pos) {
+    if (cx < 0 || cy < 0 || cz < 0) return false;
+    auto editor = cast<CGameCtnEditorFree>(GetApp().Editor);
+    if (editor is null || editor.PluginMapType is null) return false;
+    vec3 v = editor.PluginMapType.GetVec3FromCoord(nat3(cx, cy, cz));
+    // Some builds return the cell centre rather than its min corner.
+    if (Math::Abs(v.x - (cx * 32.0 + 16.0)) < 1.0) v -= vec3(16.0, 4.0, 16.0);
+    pos = v;
+    return true;
+}
 
 void MG_CalibrateWorldSpace(CGameCtnChallenge@ map) {
+    if (map is null) return;
     for (uint i = 0; i < map.Blocks.Length; i++) {
         CGameCtnBlock@ b = map.Blocks[i];
         if (int(b.Coord.x) < 0) continue; // grid blocks only
         Editor::BlockSpec@ spec = Editor::MakeBlockSpec(b);
-        if (spec is null) continue;
-        g_mgWorldBaseY = spec.pos.y - (b.Coord.y * 8.0);
-        MG_Log("merge: world-space calibration baseY=" + g_mgWorldBaseY +
+        if (spec is null || spec.isFree) continue;
+        float memBase = spec.pos.y - (b.Coord.y * 8.0);
+        vec3 floor;
+        if (MG_CoordFloorWorld(int(b.Coord.x), int(b.Coord.y), int(b.Coord.z), floor)) {
+            g_mgGridWorldBaseY = floor.y - (b.Coord.y * 8.0);
+            g_mgFreeMemOffsetY = memBase - g_mgGridWorldBaseY;
+        } else {
+            g_mgGridWorldBaseY = memBase - g_mgFreeMemOffsetY;
+        }
+        MG_Log("merge: world-space calibration gridBaseY=" + g_mgGridWorldBaseY +
+               " freeMemOffsetY=" + g_mgFreeMemOffsetY +
                " (from live block '" + b.DescId.GetName() + "' at cell y=" + b.Coord.y + ")");
         return;
     }
 }
 
 vec3 MG_BlockWorldPos(const MGBlock&in b) {
-    if (b.isFree) return b.freePos + vec3(0, g_mgWorldBaseY, 0); // memory space
-    // E++ Math.as formula with the calibrated base offset:
-    // pos = (coord.x*32, coord.y*8 + baseY, coord.z*32), + half cell = center
-    return vec3(b.cx * 32.0 + 16.0, b.cy * 8.0 + g_mgWorldBaseY + 4.0, b.cz * 32.0 + 16.0);
+    if (b.isFree) return b.freePos; // manifest free pos is already world (file) space
+    vec3 floor;
+    if (!MG_CoordFloorWorld(b.cx, b.cy, b.cz, floor)) {
+        floor = vec3(b.cx * 32.0, b.cy * 8.0 + g_mgGridWorldBaseY, b.cz * 32.0);
+    }
+    return floor + vec3(16.0, 4.0, 16.0);
 }
 
 vec3 MG_ItemWorldPos(const MGItem&in i) {
     return i.position; // items' manifest position IS the render-space position
 }
 
+vec3 g_mgLastCamTarget = vec3(-99999, -99999, -99999);
+
 void MG_JumpCamera(const vec3&in target) {
+    // E++ orbital API (see Editor++ BI_MainTab): second arg is the TARGET position,
+    // not the camera eye. Passing target+offset was why aim drifted / missed the block.
+    if (Math::Abs(target.x - g_mgLastCamTarget.x) < 0.5 &&
+        Math::Abs(target.y - g_mgLastCamTarget.y) < 0.5 &&
+        Math::Abs(target.z - g_mgLastCamTarget.z) < 0.5) {
+        return; // already aimed here — don't re-animate (prevents micro-drift)
+    }
+    g_mgLastCamTarget = target;
     try {
-        bool ok = Editor::SetCamAnimationGoTo(Editor::DirToLookUvFromCamera(target), target + vec3(0, 64, 128), 192.0);
-        MG_Log("merge: go -> camera to " + target.ToString() + " -> " + (ok ? "true" : "false"));
+        vec2 uv = Editor::DirToLookUvFromCamera(target);
+        if (uv.y < 0.7) uv.y = 0.7;
+        bool ok = Editor::SetCamAnimationGoTo(uv, target, 160.0);
+        MG_Log("merge: go -> look at " + target.ToString() + " -> " + (ok ? "true" : "false"));
     } catch {
         MG_Log("merge: camera jump failed: " + getExceptionInfo());
+        try {
+            CGameCtnEditorFree@ ed = GetEditorFree();
+            if (ed !is null && ed.PluginMapType !is null) {
+                ed.PluginMapType.CameraTargetPosition = target;
+                ed.PluginMapType.CameraToTargetDistance = 160.0;
+                ed.PluginMapType.CameraVAngle = 0.55;
+            }
+        } catch { }
     }
 }
 
-// Draws unresolved conflicts as 3D wireframes every frame (called from Render()):
-// green box = ours (in place), red ghost box = theirs. Resolved ones vanish.
+// Resolve BlockInfo for preview/apply: live map → inventory → PluginMapType (incl. terrain).
+CGameCtnBlockInfo@ MG_ResolveBlockInfo(const string&in name) {
+    CGameCtnChallenge@ map = GetMap();
+    if (map !is null) {
+        for (uint i = 0; i < map.Blocks.Length; i++) {
+            if (map.Blocks[i].DescId.GetName() == name && map.Blocks[i].BlockInfo !is null) {
+                return map.Blocks[i].BlockInfo;
+            }
+        }
+        for (uint j = 0; j < map.BakedBlocks.Length; j++) {
+            if (map.BakedBlocks[j].DescId.GetName() == name && map.BakedBlocks[j].BlockInfo !is null) {
+                return map.BakedBlocks[j].BlockInfo;
+            }
+        }
+    }
+    CGameCtnBlockInfo@ inv = Editor::GetInventoryBlockInfoByName(name);
+    if (inv !is null) return inv;
+    CGameCtnEditorFree@ ed = GetEditorFree();
+    if (ed !is null && ed.PluginMapType !is null) {
+        try {
+            CGameCtnBlockInfo@ m = ed.PluginMapType.GetBlockModelFromName(name);
+            if (m !is null) return m;
+        } catch { }
+        try {
+            CGameCtnBlockInfo@ t = ed.PluginMapType.GetTerrainBlockModelFromName(name);
+            if (t !is null) return t;
+        } catch { }
+    }
+    return null;
+}
+
+// Clip/connector pieces ("...FC", "...FCBGround") are generated by the game around
+// the blocks a player places; they can't be placed directly and are regenerated on
+// their own, so the merge leaves them to the game.
+dictionary g_mgAutoBlockCache;
+
+bool MG_NameLooksLikeClip(const string&in name) {
+    int at = name.IndexOf("FC");
+    while (at >= 0) {
+        int next = at + 2;
+        if (next >= int(name.Length)) return true;
+        string ch = name.SubStr(next, 1);
+        if (ch != ch.ToLower()) return true; // followed by an uppercase letter
+        int rel = name.SubStr(next).IndexOf("FC");
+        at = rel < 0 ? -1 : next + rel;
+    }
+    return false;
+}
+
+bool MG_IsAutoBlock(const string&in name) {
+    bool cached = false;
+    if (g_mgAutoBlockCache.Get(name, cached)) return cached;
+    bool isAuto;
+    CGameCtnBlockInfo@ info = MG_ResolveBlockInfo(name);
+    if (info !is null) isAuto = info.IsClip;
+    else isAuto = MG_NameLooksLikeClip(name);
+    g_mgAutoBlockCache.Set(name, isAuto);
+    return isAuto;
+}
+
+// Copy of `m` without auto-generated blocks, re-keyed canonically.
+MGManifest@ MG_WithoutAutoBlocks(MGManifest@ m) {
+    MGManifest@ r = MGManifest();
+    @r.mapInfo = m.mapInfo;
+    for (uint i = 0; i < m.blocks.Length; i++) {
+        if (!MG_IsAutoBlock(m.blocks[i].name)) r.blocks.InsertLast(m.blocks[i]);
+    }
+    for (uint i = 0; i < m.items.Length; i++) r.items.InsertLast(m.items[i]);
+    r.embeddedEntryCount = m.embeddedEntryCount;
+    for (uint i = 0; i < m.embeddedEntries.Length; i++) r.embeddedEntries.InsertLast(m.embeddedEntries[i]);
+    MG_Recanonicalize(r);
+    return r;
+}
+
+// Conflict markers are a NanoVG screen overlay projected from world space.
+// Editor++'s DrawLinesAndQuads shares one colour across all instances and writes into
+// internal editor trees that don't render on every game build, so it isn't used here.
 bool g_mgMarkersLogged = false;
+int g_mgNvgFont = -1;
+
+vec4 MG_COL_THEIRS = vec4(1.0, 0.25, 0.25, 1.0);
+vec4 MG_COL_OURS   = vec4(0.2, 0.95, 0.4, 1.0);
+
+bool MG_ToScreen(const vec3&in world, vec2&out screen) {
+    vec3 s = Camera::ToScreen(world);
+    screen = s.xy;
+    return s.z < 0; // z >= 0 means behind the camera
+}
+
+void MG_NvgWorldSegment(const vec3&in a, const vec3&in b) {
+    vec2 sa, sb;
+    if (!MG_ToScreen(a, sa) || !MG_ToScreen(b, sb)) return;
+    nvg::MoveTo(sa);
+    nvg::LineTo(sb);
+}
+
+void MG_NvgBoxPath(const vec3&in center, const vec3&in h) {
+    vec3 a = center - h;
+    vec3 b = center + h;
+    MG_NvgWorldSegment(vec3(a.x, a.y, a.z), vec3(b.x, a.y, a.z));
+    MG_NvgWorldSegment(vec3(a.x, b.y, a.z), vec3(b.x, b.y, a.z));
+    MG_NvgWorldSegment(vec3(a.x, a.y, b.z), vec3(b.x, a.y, b.z));
+    MG_NvgWorldSegment(vec3(a.x, b.y, b.z), vec3(b.x, b.y, b.z));
+    MG_NvgWorldSegment(vec3(a.x, a.y, a.z), vec3(a.x, b.y, a.z));
+    MG_NvgWorldSegment(vec3(b.x, a.y, a.z), vec3(b.x, b.y, a.z));
+    MG_NvgWorldSegment(vec3(a.x, a.y, b.z), vec3(a.x, b.y, b.z));
+    MG_NvgWorldSegment(vec3(b.x, a.y, b.z), vec3(b.x, b.y, b.z));
+    MG_NvgWorldSegment(vec3(a.x, a.y, a.z), vec3(a.x, a.y, b.z));
+    MG_NvgWorldSegment(vec3(b.x, a.y, a.z), vec3(b.x, a.y, b.z));
+    MG_NvgWorldSegment(vec3(a.x, b.y, a.z), vec3(a.x, b.y, b.z));
+    MG_NvgWorldSegment(vec3(b.x, b.y, a.z), vec3(b.x, b.y, b.z));
+}
+
+void MG_NvgStrokeBox(const vec3&in center, const vec3&in h, const vec4&in col, float width) {
+    // Dark under-stroke keeps the coloured outline readable on any background.
+    nvg::BeginPath();
+    MG_NvgBoxPath(center, h);
+    nvg::StrokeColor(vec4(0, 0, 0, 0.75));
+    nvg::StrokeWidth(width + 3.0);
+    nvg::Stroke();
+    nvg::BeginPath();
+    MG_NvgBoxPath(center, h);
+    nvg::StrokeColor(col);
+    nvg::StrokeWidth(width);
+    nvg::Stroke();
+}
+
+void MG_NvgLabel(const vec2&in anchor, const string&in text, const vec4&in col) {
+    if (g_mgNvgFont < 0) g_mgNvgFont = nvg::LoadFont("DroidSans.ttf");
+    nvg::FontFace(g_mgNvgFont);
+    nvg::FontSize(18.0);
+    nvg::TextAlign(nvg::Align::Center | nvg::Align::Middle);
+    vec2 bounds = nvg::TextBounds(text);
+    vec2 pad = vec2(10, 5);
+    vec2 size = bounds + pad * 2.0;
+    vec2 tl = anchor - vec2(size.x * 0.5, size.y);
+    nvg::BeginPath();
+    nvg::RoundedRect(tl, size, 6.0);
+    nvg::FillColor(vec4(0.05, 0.05, 0.07, 0.85));
+    nvg::Fill();
+    nvg::StrokeColor(col);
+    nvg::StrokeWidth(2.0);
+    nvg::Stroke();
+    nvg::FillColor(col);
+    nvg::Text(tl + size * 0.5, text);
+}
+
+// Pin at the screen edge pointing toward a marker that is off-screen or behind the camera.
+void MG_NvgOffscreenArrow(const vec3&in world, const vec4&in col) {
+    vec2 scr = vec2(Display::GetWidth(), Display::GetHeight());
+    vec2 mid = scr * 0.5;
+    vec3 s = Camera::ToScreen(world);
+    vec2 dir = s.xy - mid;
+    if (s.z >= 0) dir = dir * -1.0;
+    if (dir.LengthSquared() < 1.0) dir = vec2(0, 1);
+    dir = dir.Normalized();
+    float margin = 40.0;
+    float tx = dir.x != 0 ? (mid.x - margin) / Math::Abs(dir.x) : 1e9;
+    float ty = dir.y != 0 ? (mid.y - margin) / Math::Abs(dir.y) : 1e9;
+    vec2 p = mid + dir * Math::Min(tx, ty);
+    vec2 perp = vec2(-dir.y, dir.x);
+    nvg::BeginPath();
+    nvg::MoveTo(p + dir * 18.0);
+    nvg::LineTo(p - dir * 10.0 + perp * 14.0);
+    nvg::LineTo(p - dir * 10.0 - perp * 14.0);
+    nvg::ClosePath();
+    nvg::FillColor(col);
+    nvg::Fill();
+    nvg::StrokeColor(vec4(0, 0, 0, 0.8));
+    nvg::StrokeWidth(2.0);
+    nvg::Stroke();
+}
+
+bool MG_OnScreen(const vec3&in world) {
+    vec2 s;
+    if (!MG_ToScreen(world, s)) return false;
+    return s.x >= 0 && s.y >= 0 && s.x <= Display::GetWidth() && s.y <= Display::GetHeight();
+}
+
+void MG_DrawMarker(const vec3&in center, const vec4&in col, const string&in label, float pulse, float labelLift) {
+    if (!MG_OnScreen(center)) {
+        MG_NvgOffscreenArrow(center, col);
+        return;
+    }
+    MG_NvgStrokeBox(center, vec3(16, 4, 16), col, 2.5);
+    vec3 grow = vec3(1, 1, 1) * (1.5 + 2.5 * pulse);
+    vec4 glow = vec4(col.x, col.y, col.z, 0.35 + 0.4 * (1.0 - pulse));
+    MG_NvgStrokeBox(center, vec3(16, 4, 16) + grow, glow, 1.5);
+
+    vec3 top = center + vec3(0, 4, 0);
+    vec3 tip = center + vec3(0, 28 + labelLift, 0);
+    nvg::BeginPath();
+    MG_NvgWorldSegment(top, tip);
+    nvg::StrokeColor(col);
+    nvg::StrokeWidth(2.0);
+    nvg::Stroke();
+    vec2 s;
+    if (MG_ToScreen(tip, s)) MG_NvgLabel(s, label, col);
+}
 
 void MG_DrawConflictMarkersFrame() {
     if (!g_mgMergeActive || g_mgConflicts.Length == 0) return;
+    if (GetEditorFree() is null) return;
 
-    auto theirsDI = Editor::DrawLinesAndQuads::GetOrCreateDrawInstance("mapgit-merge-theirs");
-    if (theirsDI is null) return;
-    theirsDI.ResetLines();
-    theirsDI.RequestLineColor(vec3(1, 0.25, 0.25)); // red — theirs (ghost)
-    bool anyTheirs = false;
-    vec3 firstTheirsPos = vec3();
+    float pulse = (Math::Sin(float(Time::Now) / 250.0) + 1.0) * 0.5;
+    nvg::Reset();
+    nvg::LineCap(nvg::LineCapType::Round);
+    nvg::LineJoin(nvg::LineCapType::Round);
 
-    auto oursDI = Editor::DrawLinesAndQuads::GetOrCreateDrawInstance("mapgit-merge-ours");
-    if (oursDI is null) return;
-    oursDI.ResetLines();
-    oursDI.RequestLineColor(vec3(0.3, 1, 0.4)); // green — ours (in place)
-    bool anyOurs = false;
-    vec3 firstOursPos = vec3();
-
-    vec3 h = vec3(16, 4, 16); // half extents of a 32x8x32 block cell
-
+    bool showOurs = g_mgViewMode != 2;
+    bool showTheirs = g_mgViewMode != 1;
     for (uint ci = 0; ci < g_mgConflicts.Length; ci++) {
         MGMergeConflict@ c = g_mgConflicts[ci];
-        if (c.resolution != 0) continue; // resolved — no marker
+        if (c.resolution != 0) continue;
+        if (!g_mgShowAllConflicts && int(ci) != g_mgConflictFocus) continue;
 
-        if (c.hasTheirsPos) {
-            if (!anyTheirs) firstTheirsPos = c.theirsPos;
-            vec3 a = c.theirsPos - h;
-            vec3 b = c.theirsPos + h;
-            theirsDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(b.x, a.y, a.z));
-            theirsDI.PushLineSegment(vec3(a.x, b.y, a.z), vec3(b.x, b.y, a.z));
-            theirsDI.PushLineSegment(vec3(a.x, a.y, b.z), vec3(b.x, a.y, b.z));
-            theirsDI.PushLineSegment(vec3(a.x, b.y, b.z), vec3(b.x, b.y, b.z));
-            theirsDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(a.x, b.y, a.z));
-            theirsDI.PushLineSegment(vec3(b.x, a.y, a.z), vec3(b.x, b.y, a.z));
-            theirsDI.PushLineSegment(vec3(a.x, a.y, b.z), vec3(a.x, b.y, b.z));
-            theirsDI.PushLineSegment(vec3(b.x, a.y, b.z), vec3(b.x, b.y, b.z));
-            theirsDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(a.x, a.y, b.z));
-            theirsDI.PushLineSegment(vec3(b.x, a.y, a.z), vec3(b.x, a.y, b.z));
-            theirsDI.PushLineSegment(vec3(a.x, b.y, a.z), vec3(a.x, b.y, b.z));
-            theirsDI.PushLineSegment(vec3(b.x, b.y, a.z), vec3(b.x, b.y, b.z));
-            anyTheirs = true;
+        string num = "#" + (ci + 1) + "  ";
+        bool same = c.hasTheirsPos && c.hasOursPos && (c.theirsPos - c.oursPos).LengthSquared() < 1.0;
+        if (c.hasOursPos && showOurs) {
+            string lbl = num + "Yours: " + MG_PrettyName(c.oursSummary);
+            if (!c.hasTheirsPos) lbl += " (they removed it)";
+            MG_DrawMarker(c.oursPos, MG_COL_OURS, lbl, pulse, 0.0);
         }
-        if (c.hasOursPos) {
-            if (!anyOurs) firstOursPos = c.oursPos;
-            vec3 a = c.oursPos - h;
-            vec3 b = c.oursPos + h;
-            oursDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(b.x, a.y, a.z));
-            oursDI.PushLineSegment(vec3(a.x, b.y, a.z), vec3(b.x, b.y, a.z));
-            oursDI.PushLineSegment(vec3(a.x, a.y, b.z), vec3(b.x, a.y, b.z));
-            oursDI.PushLineSegment(vec3(a.x, b.y, b.z), vec3(b.x, b.y, b.z));
-            oursDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(a.x, b.y, a.z));
-            oursDI.PushLineSegment(vec3(b.x, a.y, a.z), vec3(b.x, b.y, a.z));
-            oursDI.PushLineSegment(vec3(a.x, a.y, b.z), vec3(a.x, b.y, b.z));
-            oursDI.PushLineSegment(vec3(b.x, a.y, b.z), vec3(b.x, b.y, b.z));
-            oursDI.PushLineSegment(vec3(a.x, a.y, a.z), vec3(a.x, a.y, b.z));
-            oursDI.PushLineSegment(vec3(b.x, a.y, a.z), vec3(b.x, a.y, b.z));
-            oursDI.PushLineSegment(vec3(a.x, b.y, a.z), vec3(a.x, b.y, b.z));
-            oursDI.PushLineSegment(vec3(b.x, b.y, a.z), vec3(b.x, b.y, b.z));
-            anyOurs = true;
+        if (c.hasTheirsPos && showTheirs) {
+            string lbl = num + "Theirs: " + MG_PrettyName(c.theirsSummary);
+            if (!c.hasOursPos) lbl += " (you removed yours)";
+            MG_DrawMarker(c.theirsPos, MG_COL_THEIRS, lbl, pulse, (same && showOurs) ? 16.0 : 0.0);
         }
     }
-    if (anyTheirs) theirsDI.Draw();
-    if (anyOurs) oursDI.Draw();
+
     if (!g_mgMarkersLogged && g_mgConflicts.Length > 0) {
         g_mgMarkersLogged = true;
-        MG_Log("conflict markers frame: " + g_mgConflicts.Length + " conflicts; drawing theirs=" +
-               (anyTheirs ? "yes at " + firstTheirsPos.ToString() : "NO (no positions)") +
-               "; ours=" + (anyOurs ? "yes at " + firstOursPos.ToString() : "NO (no positions)"));
+        uint placed = 0, fallback = 0;
+        for (uint i = 0; i < g_mgConflicts.Length; i++) {
+            if (g_mgConflicts[i].previewPlaced) placed++;
+            if (g_mgConflicts[i].previewFallback) fallback++;
+        }
+        MG_Log("conflict markers: " + g_mgConflicts.Length + " conflicts; model previews=" +
+               placed + " wireframe-fallback=" + fallback);
     }
+}
+
+// ------------------------- real ghost / item conflict previews -------------------------
+
+void MG_TryApplyBlockSkin(CGameCtnBlock@ nod, MGBlock@ e) {
+    if (nod is null || e is null || !e.hasSkin) return;
+    string skin = e.hasSkinFile ? e.skinFile : e.skinUrl;
+    if (skin.Length == 0) return;
+    try {
+        CGameCtnEditorFree@ editor = GetEditorFree();
+        if (editor is null || editor.PluginMapType is null) return;
+        editor.PluginMapType.SetBlockSkin(nod, skin);
+    } catch {
+        MG_Log("merge: SetBlockSkin failed for '" + e.name + "': " + getExceptionInfo());
+    }
+}
+
+void MG_ApplySkinsAfterPlace(CGameCtnChallenge@ map, array<MGBlock@>@ placed) {
+    if (placed.Length == 0) return;
+    // Re-scan live blocks and match by name+coord/free pose to apply skins.
+    for (uint p = 0; p < placed.Length; p++) {
+        MGBlock@ e = placed[p];
+        if (e is null || !e.hasSkin) continue;
+        for (uint i = 0; i < map.Blocks.Length; i++) {
+            CGameCtnBlock@ b = map.Blocks[i];
+            if (b.DescId.GetName() != e.name) continue;
+            if (e.isFree) {
+                Editor::BlockSpec@ spec = Editor::MakeBlockSpec(b);
+                if (spec is null || !spec.isFree) continue;
+                vec3 mem = e.freePos + vec3(0, g_mgFreeMemOffsetY, 0);
+                if (Math::Abs(spec.pos.x - mem.x) > 0.5 || Math::Abs(spec.pos.z - mem.z) > 0.5) continue;
+            } else {
+                if (int(b.Coord.x) != e.cx || int(b.Coord.y) != e.cy || int(b.Coord.z) != e.cz) continue;
+            }
+            MG_TryApplyBlockSkin(b, e);
+            break;
+        }
+    }
+}
+
+array<CGameCtnBlock@> MG_PreviewCandidates(CGameCtnChallenge@ map, MGBlock@ e) {
+    array<CGameCtnBlock@> res;
+    vec3 mem = e.freePos + vec3(0, g_mgFreeMemOffsetY, 0);
+    for (uint i = 0; i < map.Blocks.Length; i++) {
+        CGameCtnBlock@ b = map.Blocks[i];
+        if (b.DescId.GetName() != e.name) continue;
+        if (e.isFree) {
+            Editor::BlockSpec@ spec = Editor::MakeBlockSpec(b);
+            if (spec is null || !spec.isFree) continue;
+            if (Math::Abs(spec.pos.x - mem.x) > 0.5 || Math::Abs(spec.pos.z - mem.z) > 0.5) continue;
+        } else {
+            if (int(b.Coord.x) != e.cx || int(b.Coord.y) != e.cy || int(b.Coord.z) != e.cz) continue;
+        }
+        res.InsertLast(b);
+    }
+    return res;
+}
+
+bool MG_PlaceOnePreviewBlock(MGMergeConflict@ c, MGBlock@ e) {
+    CGameCtnBlockInfo@ info = MG_ResolveBlockInfo(e.name);
+    if (info is null) {
+        MG_Log("preview: unknown block '" + e.name + "' — wireframe fallback");
+        c.previewFallback = true;
+        return false;
+    }
+    Editor::BlockSpec@ spec;
+    if (e.isFree) {
+        vec3 pos = e.freePos + vec3(0, g_mgFreeMemOffsetY, 0);
+        vec3 pyr = vec3(e.freeRot.y, e.freeRot.x, e.freeRot.z);
+        @spec = Editor::MakeBlockSpec(info, pos, pyr);
+    } else {
+        @spec = Editor::MakeBlockSpec(info, nat3(e.cx, e.cy, e.cz), e.direction);
+    }
+    if (spec is null) { c.previewFallback = true; return false; }
+    spec.isGhost = true; // always ghost for conflict preview (can share a cell with ours)
+    spec.isGround = e.isGround;
+    spec.color = CGameCtnBlock::EMapElemColor(4); // Red — make theirs visually distinct
+    spec.lmQual = CGameCtnBlock::EMapElemLightmapQuality(MG_LmValue(e.lmQual));
+    spec.variant = e.variant;
+    array<Editor::BlockSpec@> specs;
+    specs.InsertLast(spec);
+    CGameCtnChallenge@ map = GetMap();
+    if (map is null) { c.previewFallback = true; return false; }
+    uint before = map.Blocks.Length;
+    array<CGameCtnBlock@> existing = MG_PreviewCandidates(map, e);
+    if (!Editor::PlaceBlocks(specs, false)) {
+        MG_Log("preview: PlaceBlocks failed for '" + e.name + "' — wireframe fallback");
+        c.previewFallback = true;
+        return false;
+    }
+    // The preview is whichever matching block wasn't there before placement.
+    array<CGameCtnBlock@> after = MG_PreviewCandidates(map, e);
+    for (uint i = 0; i < after.Length; i++) {
+        bool wasThere = false;
+        for (uint j = 0; j < existing.Length; j++) {
+            if (existing[j] is after[i]) { wasThere = true; break; }
+        }
+        if (wasThere) continue;
+        @c.previewBlock = after[i];
+        c.previewPlaced = true;
+        MG_TryApplyBlockSkin(after[i], e);
+        return true;
+    }
+    if (map.Blocks.Length > before) {
+        @c.previewBlock = map.Blocks[map.Blocks.Length - 1];
+        c.previewPlaced = true;
+        return true;
+    }
+    MG_Log("preview: placed '" + e.name + "' but could not find the nod — wireframe fallback");
+    c.previewFallback = true;
+    return false;
+}
+
+bool MG_PlaceOnePreviewItem(MGMergeConflict@ c, MGItem@ e) {
+    CGameCtnChallenge@ map = GetMap();
+    if (map is null) { c.previewFallback = true; return false; }
+    CGameItemModel@ model = MG_FindItemModel(map, e.itemModel);
+    if (model is null) {
+        MG_Log("preview: unknown item '" + e.itemModel + "' — wireframe fallback (custom item may need embedding)");
+        c.previewFallback = true;
+        return false;
+    }
+    vec3 pyr = vec3(e.rotation.y, e.rotation.x, e.rotation.z);
+    Editor::ItemSpec@ spec = Editor::MakeItemSpec(model, e.position, pyr);
+    if (spec is null) { c.previewFallback = true; return false; }
+    spec.scale = e.scale;
+    spec.color = CGameCtnAnchoredObject::EMapElemColor(MG_ColorValue(e.color));
+    spec.lmQual = CGameCtnAnchoredObject::EMapElemLightmapQuality(MG_LmValue(e.lmQual));
+    array<Editor::ItemSpec@> specs;
+    specs.InsertLast(spec);
+    uint before = map.AnchoredObjects.Length;
+    if (!Editor::PlaceItems(specs, false)) {
+        MG_Log("preview: PlaceItems failed for '" + e.itemModel + "' — wireframe fallback");
+        c.previewFallback = true;
+        return false;
+    }
+    // Prefer the last anchored object (newly placed)
+    if (map.AnchoredObjects.Length > before) {
+        @c.previewItem = map.AnchoredObjects[map.AnchoredObjects.Length - 1];
+        c.previewPlaced = true;
+        return true;
+    }
+    c.previewFallback = true;
+    return false;
+}
+
+bool MG_PlaceOnePreview(MGMergeConflict@ c) {
+    if (c.resolution != 0 || !c.hasTheirsPos) return false;
+    if (c.section == "block" && c.theirsBlock !is null) return MG_PlaceOnePreviewBlock(c, c.theirsBlock);
+    if (c.section == "item" && c.theirsItem !is null) return MG_PlaceOnePreviewItem(c, c.theirsItem);
+    return false;
+}
+
+// "Only theirs" lifts your live block/item out of the map while it is being looked at.
+// E++ specs carry waypoint data, so putting them back restores the exact original.
+array<Editor::BlockSpec@> g_mgHiddenOursBlocks;
+array<MGBlock@> g_mgHiddenOursBlockEntries;
+array<Editor::ItemSpec@> g_mgHiddenOursItems;
+
+CGameCtnAnchoredObject@ MG_FindLiveItem(CGameCtnChallenge@ map, MGItem@ e) {
+    for (uint i = 0; i < map.AnchoredObjects.Length; i++) {
+        CGameCtnAnchoredObject@ a = map.AnchoredObjects[i];
+        if (a.ItemModel is null || a.ItemModel.Id.GetName() != e.itemModel) continue;
+        if ((a.AbsolutePositionInMap - e.position).Length() < 0.05) return a;
+    }
+    return null;
+}
+
+void MG_HideOurs(MGMergeConflict@ c) {
+    CGameCtnChallenge@ map = GetMap();
+    if (map is null || c.resolution != 0) return;
+    if (c.oursBlock !is null) {
+        array<CGameCtnBlock@> cands = MG_PreviewCandidates(map, c.oursBlock);
+        if (cands.Length == 0) return;
+        Editor::BlockSpec@ spec = Editor::MakeBlockSpec(cands[0]);
+        if (spec is null) return;
+        array<CGameCtnBlock@> del = { cands[0] };
+        if (!Editor::DeleteBlocks(del, false)) return;
+        g_mgHiddenOursBlocks.InsertLast(spec);
+        g_mgHiddenOursBlockEntries.InsertLast(c.oursBlock);
+    } else if (c.oursItem !is null) {
+        CGameCtnAnchoredObject@ a = MG_FindLiveItem(map, c.oursItem);
+        if (a is null) return;
+        Editor::ItemSpec@ spec = Editor::MakeItemSpec(a);
+        if (spec is null) return;
+        array<CGameCtnAnchoredObject@> del = { a };
+        if (Editor::DeleteItems(del, false)) g_mgHiddenOursItems.InsertLast(spec);
+    }
+}
+
+void MG_RestoreHiddenOurs() {
+    if (g_mgHiddenOursBlocks.Length > 0) {
+        if (!Editor::PlaceBlocks(g_mgHiddenOursBlocks, false)) {
+            MG_Log("preview: could not put your hidden block(s) back — use Cancel to restore your version");
+        } else {
+            CGameCtnChallenge@ map = GetMap();
+            for (uint i = 0; map !is null && i < g_mgHiddenOursBlockEntries.Length; i++) {
+                MGBlock@ e = g_mgHiddenOursBlockEntries[i];
+                if (!e.hasSkin) continue;
+                array<CGameCtnBlock@> cands = MG_PreviewCandidates(map, e);
+                if (cands.Length > 0) MG_TryApplyBlockSkin(cands[0], e);
+            }
+        }
+    }
+    if (g_mgHiddenOursItems.Length > 0) {
+        if (!Editor::PlaceItems(g_mgHiddenOursItems, false)) {
+            MG_Log("preview: could not put your hidden item(s) back — use Cancel to restore your version");
+        }
+    }
+    g_mgHiddenOursBlocks.RemoveRange(0, g_mgHiddenOursBlocks.Length);
+    g_mgHiddenOursBlockEntries.RemoveRange(0, g_mgHiddenOursBlockEntries.Length);
+    g_mgHiddenOursItems.RemoveRange(0, g_mgHiddenOursItems.Length);
+}
+
+// Ghost models exist only for what is currently being looked at, so the scene stays readable.
+void MG_RefreshConflictPreviews() {
+    MG_ClearConflictPreviews();
+    if (!g_mgMergeActive || g_mgViewMode == 1) return;
+    uint placed = 0;
+    for (uint i = 0; i < g_mgConflicts.Length; i++) {
+        if (!g_mgShowAllConflicts && int(i) != g_mgConflictFocus) continue;
+        if (g_mgViewMode == 2) MG_HideOurs(g_mgConflicts[i]);
+        if (MG_PlaceOnePreview(g_mgConflicts[i])) placed++;
+    }
+    MG_Log("conflict previews: placed " + placed + " real models");
+}
+
+void MG_PlaceConflictPreviews() {
+    if (GetMap() is null) return;
+    g_mgShowAllConflicts = false;
+    g_mgViewMode = 0;
+    int first = MG_NextUnresolvedConflict(-1);
+    MG_SetConflictFocus(first < 0 ? 0 : first);
+}
+
+void MG_SetConflictFocus(int index) {
+    if (index < 0 || index >= int(g_mgConflicts.Length)) return;
+    g_mgConflictFocus = index;
+    MG_RefreshConflictPreviews();
+    MG_FocusConflictCamera(index);
+}
+
+void MG_SetConflictViewMode(int mode) {
+    if (mode == g_mgViewMode) return;
+    g_mgViewMode = mode;
+    MG_RefreshConflictPreviews();
+}
+
+void MG_SetShowAllConflicts(bool all) {
+    if (all == g_mgShowAllConflicts) return;
+    g_mgShowAllConflicts = all;
+    MG_RefreshConflictPreviews();
+}
+
+void MG_FocusConflictCamera(int index) {
+    if (index < 0 || index >= int(g_mgConflicts.Length)) return;
+    MGMergeConflict@ c = g_mgConflicts[index];
+    g_mgLastCamTarget = vec3(-99999, -99999, -99999); // allow re-aim
+    bool preferOurs = g_mgViewMode == 1;
+    if (preferOurs && c.hasOursPos) MG_JumpCamera(c.oursPos);
+    else if (c.hasTheirsPos) MG_JumpCamera(c.theirsPos);
+    else if (c.hasOursPos) MG_JumpCamera(c.oursPos);
+}
+
+// "RoadTechCurve2" -> "Road Tech Curve 2"; item paths -> file name without ".Item.Gbx".
+string MG_PrettyName(const string&in raw) {
+    if (raw == "(deleted)") return "nothing";
+    string s = raw;
+    int slash = -1;
+    for (int k = 0; k < s.Length; k++) {
+        if (s[k] == 0x2F || s[k] == 0x5C) slash = k;
+    }
+    if (slash >= 0) s = s.SubStr(slash + 1);
+    string lower = s.ToLower();
+    if (lower.EndsWith(".item.gbx")) s = s.SubStr(0, s.Length - 9);
+    else if (lower.EndsWith(".block.gbx")) s = s.SubStr(0, s.Length - 10);
+    string res = "";
+    for (int i = 0; i < s.Length; i++) {
+        uint8 ch = s[i];
+        if (i > 0) {
+            uint8 prev = s[i - 1];
+            bool up = ch >= 0x41 && ch <= 0x5A;
+            bool dig = ch >= 0x30 && ch <= 0x39;
+            bool prevLower = prev >= 0x61 && prev <= 0x7A;
+            bool prevDig = prev >= 0x30 && prev <= 0x39;
+            if ((up && (prevLower || prevDig)) || (dig && !prevDig && prev != 0x20)) res += " ";
+        }
+        res += s.SubStr(i, 1);
+    }
+    return res;
+}
+
+int MG_NextUnresolvedConflict(int from) {
+    for (uint i = 0; i < g_mgConflicts.Length; i++) {
+        int ix = (from + 1 + int(i)) % int(g_mgConflicts.Length);
+        if (g_mgConflicts[ix].resolution == 0) return ix;
+    }
+    return -1;
+}
+
+int MG_PrevUnresolvedConflict(int from) {
+    int n = int(g_mgConflicts.Length);
+    for (int i = 1; i <= n; i++) {
+        int ix = ((from - i) % n + n) % n;
+        if (g_mgConflicts[ix].resolution == 0) return ix;
+    }
+    return -1;
+}
+
+int MG_CountUnresolvedConflicts() {
+    int n = 0;
+    for (uint i = 0; i < g_mgConflicts.Length; i++) {
+        if (g_mgConflicts[i].resolution == 0) n++;
+    }
+    return n;
+}
+
+string MG_FriendlyConflictTitle(MGMergeConflict@ c) {
+    if (c.section == "mapInfo") return "Map details differ";
+    if (c.section == "embedded") return "Custom embedded files differ";
+    if (c.section == "media") return "You both changed the MediaTracker clips (intro, in-game or end cameras)";
+    if (c.kind == 6) return "You each put the start somewhere different — a map can only have one";
+    if (c.kind == 2) return "You changed this — they removed it";
+    if (c.kind == 3) return "You removed this — they changed it";
+    if (c.kind == 0) return "You both added something different here";
+    return "You both changed this spot differently";
+}
+
+string MG_FriendlySideLabel(const string&in summary, bool isYours) {
+    if (summary == "(deleted)") return isYours ? "Nothing (you removed it)" : "Nothing (they removed it)";
+    if (summary.Length == 0) return isYours ? "Your version" : "Their version";
+    return summary;
+}
+
+void MG_ClearConflictPreviews() {
+    array<CGameCtnBlock@> blocks;
+    array<CGameCtnAnchoredObject@> items;
+    for (uint i = 0; i < g_mgConflicts.Length; i++) {
+        MGMergeConflict@ c = g_mgConflicts[i];
+        if (c.previewBlock !is null) blocks.InsertLast(c.previewBlock);
+        if (c.previewItem !is null) items.InsertLast(c.previewItem);
+        @c.previewBlock = null;
+        @c.previewItem = null;
+        c.previewPlaced = false;
+        c.previewFallback = false;
+    }
+    if (blocks.Length > 0) {
+        try { Editor::DeleteBlocks(blocks, false); } catch {
+            MG_Log("preview clear: DeleteBlocks failed: " + getExceptionInfo());
+        }
+    }
+    if (items.Length > 0) {
+        try { Editor::DeleteItems(items, false); } catch {
+            MG_Log("preview clear: DeleteItems failed: " + getExceptionInfo());
+        }
+    }
+    MG_RestoreHiddenOurs();
 }
 
 // ------------------------- merge state -------------------------
@@ -296,7 +1009,7 @@ void MG_DrawConflictMarkersFrame() {
 bool g_mgMergeActive = false;
 string g_mgMergeRepoDir = "";
 string g_mgMergeBranch = "";      // ours (current)
-string g_mgMergeSource = "";      // theirs (source branch)
+string g_mgMergeSource = "";      // theirs (source branch / origin label)
 string g_mgMergeOursTip = "";
 string g_mgMergeTheirsTip = "";
 string g_mgMergeBaseSha = "";
@@ -304,8 +1017,14 @@ array<MGMergeConflict@> g_mgConflicts;
 array<string> g_mgAppliedChanges;
 MGManifest@ g_mgMergedClean;      // ours + clean takes (conflict resolutions applied at finalize)
 MGMapInfo@ g_mgTheirsMapInfo;     // for metadata conflict resolutions
+MGManifest@ g_mgTheirsManifest;   // full theirs (embedded take-theirs)
 string g_mgMergeStatus = "";
 int g_mgMergeSel = 0;             // source branch combo selection
+bool g_mgMergePushAfter = false;  // everyday Apply & Share / Update after merge
+string g_mgMergePendingRemoteGit = ""; // git sha to write into sync state after merge+push
+int g_mgConflictFocus = 0;           // which conflict is being looked at
+bool g_mgShowAllConflicts = false;   // developer tools: show every unresolved conflict at once
+int g_mgViewMode = 0;                // 0 = both versions, 1 = only yours, 2 = only theirs
 
 // ------------------------- merge base -------------------------
 
@@ -417,7 +1136,7 @@ void MG_MergeKeyedBlocks(MGBlockIndex@ b, MGBlockIndex@ o, MGBlockIndex@ t,
             c.kind = 0; c.section = "block"; c.key = key;
             c.oursSummary = o.src[oi].name; c.theirsSummary = t.src[ti].name;
             @c.theirsBlock = t.src[ti];
-            c.oursPos = MG_BlockWorldPos(o.src[oi]); c.hasOursPos = true;
+            c.oursPos = MG_BlockWorldPos(o.src[oi]); c.hasOursPos = true; @c.oursBlock = o.src[oi];
             c.theirsPos = MG_BlockWorldPos(t.src[ti]); c.hasTheirsPos = true;
             g_mgConflicts.InsertLast(c);
         }
@@ -433,7 +1152,7 @@ void MG_MergeKeyedBlocks(MGBlockIndex@ b, MGBlockIndex@ o, MGBlockIndex@ t,
             MGMergeConflict@ c = MGMergeConflict();
             c.kind = 2; c.section = "block"; c.key = key;
             c.oursSummary = o.src[oi].name; c.theirsSummary = "(deleted)"; c.baseSummary = b.src[bi].name;
-            c.oursPos = MG_BlockWorldPos(o.src[oi]); c.hasOursPos = true;
+            c.oursPos = MG_BlockWorldPos(o.src[oi]); c.hasOursPos = true; @c.oursBlock = o.src[oi];
             g_mgConflicts.InsertLast(c);
         }
     } else { // Modified
@@ -459,7 +1178,7 @@ void MG_MergeKeyedBlocks(MGBlockIndex@ b, MGBlockIndex@ o, MGBlockIndex@ t,
             c.kind = 1; c.section = "block"; c.key = key;
             c.oursSummary = o.src[oi].name; c.theirsSummary = t.src[ti].name; c.baseSummary = b.src[bi].name;
             @c.theirsBlock = t.src[ti];
-            c.oursPos = MG_BlockWorldPos(o.src[oi]); c.hasOursPos = true;
+            c.oursPos = MG_BlockWorldPos(o.src[oi]); c.hasOursPos = true; @c.oursBlock = o.src[oi];
             c.theirsPos = MG_BlockWorldPos(t.src[ti]); c.hasTheirsPos = true;
             g_mgConflicts.InsertLast(c);
         }
@@ -482,7 +1201,7 @@ void MG_MergeKeyedItems(MGItemIndex@ b, MGItemIndex@ o, MGItemIndex@ t,
             c.kind = 0; c.section = "item"; c.key = key;
             c.oursSummary = o.src[oi].itemModel; c.theirsSummary = t.src[ti].itemModel;
             @c.theirsItem = t.src[ti];
-            c.oursPos = MG_ItemWorldPos(o.src[oi]); c.hasOursPos = true;
+            c.oursPos = MG_ItemWorldPos(o.src[oi]); c.hasOursPos = true; @c.oursItem = o.src[oi];
             c.theirsPos = MG_ItemWorldPos(t.src[ti]); c.hasTheirsPos = true;
             g_mgConflicts.InsertLast(c);
         }
@@ -497,7 +1216,7 @@ void MG_MergeKeyedItems(MGItemIndex@ b, MGItemIndex@ o, MGItemIndex@ t,
             MGMergeConflict@ c = MGMergeConflict();
             c.kind = 2; c.section = "item"; c.key = key;
             c.oursSummary = o.src[oi].itemModel; c.theirsSummary = "(deleted)";
-            c.oursPos = MG_ItemWorldPos(o.src[oi]); c.hasOursPos = true;
+            c.oursPos = MG_ItemWorldPos(o.src[oi]); c.hasOursPos = true; @c.oursItem = o.src[oi];
             g_mgConflicts.InsertLast(c);
         }
     } else { // Modified
@@ -522,11 +1241,109 @@ void MG_MergeKeyedItems(MGItemIndex@ b, MGItemIndex@ o, MGItemIndex@ t,
             c.kind = 1; c.section = "item"; c.key = key;
             c.oursSummary = o.src[oi].itemModel; c.theirsSummary = t.src[ti].itemModel;
             @c.theirsItem = t.src[ti];
-            c.oursPos = MG_ItemWorldPos(o.src[oi]); c.hasOursPos = true;
+            c.oursPos = MG_ItemWorldPos(o.src[oi]); c.hasOursPos = true; @c.oursItem = o.src[oi];
             c.theirsPos = MG_ItemWorldPos(t.src[ti]); c.hasTheirsPos = true;
             g_mgConflicts.InsertLast(c);
         }
     }
+}
+
+// ------------------------- same-cell block alignment -------------------------
+// Several blocks can share a cell (terrain + a block on it, stacked pieces). Their
+// stored keys get "#2", "#3" by sort order, so a change to one shifts the others and
+// the base/ours/theirs entries pair up wrongly. Re-key each shared cell by identity:
+// identical first, then same block name, then whatever is left (a type change).
+
+class MGCellSides {
+    array<int> b;
+    array<int> o;
+    array<int> t;
+}
+
+void MG_CollectCells(array<MGBlock>@ arr, int side, dictionary@ cells, array<string>@ order) {
+    for (uint i = 0; i < arr.Length; i++) {
+        string k = MG_BaseKey(arr[i].key);
+        MGCellSides@ g;
+        if (!cells.Get(k, @g) || g is null) {
+            @g = MGCellSides();
+            cells.Set(k, @g);
+            order.InsertLast(k);
+        }
+        if (side == 0) g.b.InsertLast(int(i));
+        else if (side == 1) g.o.InsertLast(int(i));
+        else g.t.InsertLast(int(i));
+    }
+}
+
+bool MG_CellPairs(MGBlock@ refB, MGBlock@ x, int pass) {
+    if (pass == 0) return refB.name == x.name && refB.contentJson == x.contentJson;
+    if (pass == 1) return refB.name == x.name;
+    return MG_IsAutoBlock(refB.name) == MG_IsAutoBlock(x.name);
+}
+
+// side 1 = ours, 2 = theirs. Theirs may also pair with ours-only slots (add/add).
+void MG_MatchCellSide(MGManifest@ baseMan, MGManifest@ oursMan, array<MGBlock>@ sideArr,
+                      array<int>@ sideIdx, array<int>@ sb, array<int>@ so, array<int>@ st, int side) {
+    array<bool> used;
+    used.Resize(sideIdx.Length);
+    for (uint j = 0; j < used.Length; j++) used[j] = false;
+    for (int pass = 0; pass < 3; pass++) {
+        for (uint s = 0; s < sb.Length; s++) {
+            if ((side == 1 ? so[s] : st[s]) >= 0) continue;
+            MGBlock@ refB = null;
+            if (sb[s] >= 0) @refB = baseMan.blocks[sb[s]];
+            else if (side == 2 && so[s] >= 0) @refB = oursMan.blocks[so[s]];
+            if (refB is null) continue;
+            for (uint j = 0; j < sideIdx.Length; j++) {
+                if (used[j]) continue;
+                if (!MG_CellPairs(refB, sideArr[sideIdx[j]], pass)) continue;
+                used[j] = true;
+                if (side == 1) so[s] = sideIdx[j]; else st[s] = sideIdx[j];
+                break;
+            }
+        }
+    }
+    for (uint j = 0; j < sideIdx.Length; j++) {
+        if (used[j]) continue;
+        sb.InsertLast(-1);
+        so.InsertLast(side == 1 ? sideIdx[j] : -1);
+        st.InsertLast(side == 2 ? sideIdx[j] : -1);
+    }
+}
+
+void MG_AlignSharedCellKeys(MGManifest@ baseMan, MGManifest@ oursMan, MGManifest@ theirsMan) {
+    dictionary cells;
+    array<string> order;
+    MG_CollectCells(baseMan.blocks, 0, cells, order);
+    MG_CollectCells(oursMan.blocks, 1, cells, order);
+    MG_CollectCells(theirsMan.blocks, 2, cells, order);
+    int realigned = 0;
+    for (uint k = 0; k < order.Length; k++) {
+        MGCellSides@ g;
+        cells.Get(order[k], @g);
+        if (g is null || (g.b.Length <= 1 && g.o.Length <= 1 && g.t.Length <= 1)) continue;
+        array<int> sb, so, st;
+        for (uint i = 0; i < g.b.Length; i++) { sb.InsertLast(g.b[i]); so.InsertLast(-1); st.InsertLast(-1); }
+        MG_MatchCellSide(baseMan, oursMan, oursMan.blocks, g.o, sb, so, st, 1);
+        MG_MatchCellSide(baseMan, oursMan, theirsMan.blocks, g.t, sb, so, st, 2);
+        for (uint s = 0; s < sb.Length; s++) {
+            string key = (s == 0) ? order[k] : order[k] + "#" + (s + 1);
+            if (sb[s] >= 0) baseMan.blocks[sb[s]].key = key;
+            if (so[s] >= 0) oursMan.blocks[so[s]].key = key;
+            if (st[s] >= 0) theirsMan.blocks[st[s]].key = key;
+        }
+        realigned++;
+    }
+    if (realigned > 0) MG_Log("merge: aligned " + realigned + " shared cell(s) by block identity");
+}
+
+bool MG_KeyIsAutoOnly(MGBlockIndex@ b, MGBlockIndex@ o, MGBlockIndex@ t, const string&in key) {
+    int bi = b.IndexOf(key), oi = o.IndexOf(key), ti = t.IndexOf(key);
+    if (bi < 0 && oi < 0 && ti < 0) return false;
+    if (bi >= 0 && !MG_IsAutoBlock(b.src[bi].name)) return false;
+    if (oi >= 0 && !MG_IsAutoBlock(o.src[oi].name)) return false;
+    if (ti >= 0 && !MG_IsAutoBlock(t.src[ti].name)) return false;
+    return true;
 }
 
 // ------------------------- merge driver -------------------------
@@ -549,6 +1366,7 @@ void MG_RunMerge(MGManifest@ baseMan, MGManifest@ oursMan, MGManifest@ theirsMan
 
     for (uint k = 0; k < keys.Length; k++) {
         string key = keys[k];
+        if (MG_KeyIsAutoOnly(bB, oB, tB, key)) continue; // ours kept; the game regenerates clips
         bool hasB = bB.Has(key);
         bool hasT = tB.Has(key);
         if (hasB && !hasT) MG_MergeKeyedBlocks(bB, oB, tB, g_mgMergedClean.blocks, key, MG_CHANGE::Removed);
@@ -606,12 +1424,19 @@ void MG_RunMerge(MGManifest@ baseMan, MGManifest@ oursMan, MGManifest@ theirsMan
         }
     }
 
-    // embedded (entry-count level until the entries port)
-    if (oursMan.embeddedEntryCount != theirsMan.embeddedEntryCount) {
-        if (oursMan.embeddedEntryCount == baseMan.embeddedEntryCount) {
+    // embedded: fingerprint set compare when entries exist; else entry-count
+    string oursEmb = MG_EmbeddedFingerprintSet(oursMan);
+    string theirsEmb = MG_EmbeddedFingerprintSet(theirsMan);
+    string baseEmb = MG_EmbeddedFingerprintSet(baseMan);
+    if (oursEmb != theirsEmb) {
+        if (oursEmb == baseEmb) {
             g_mgMergedClean.embeddedEntryCount = theirsMan.embeddedEntryCount;
+            g_mgMergedClean.embeddedEntries.RemoveRange(0, g_mgMergedClean.embeddedEntries.Length);
+            for (uint i = 0; i < theirsMan.embeddedEntries.Length; i++) {
+                g_mgMergedClean.embeddedEntries.InsertLast(theirsMan.embeddedEntries[i]);
+            }
             g_mgAppliedChanges.InsertLast("take theirs: embedded (" + theirsMan.embeddedEntryCount + " entries)");
-        } else {
+        } else if (theirsEmb != baseEmb) {
             MGMergeConflict@ c = MGMergeConflict();
             c.kind = 5; c.section = "embedded"; c.key = "zip";
             c.oursSummary = "" + oursMan.embeddedEntryCount + " entries";
@@ -668,6 +1493,22 @@ MGManifest@ MG_FinalizeMerged() {
         bool takeTheirs = (c.resolution == 2 || c.resolution == 3);
         bool dropOurs = (c.resolution == 2 || c.resolution == 4);
 
+        if (c.kind == 6) {
+            if (c.resolution != 2) continue; // keep yours: theirs was already held back
+            if (c.oursSection == "block") {
+                for (uint i = 0; i < g_mgMergedClean.blocks.Length; i++) {
+                    if (g_mgMergedClean.blocks[i].key == c.oursKey) { g_mgMergedClean.blocks.RemoveRange(i, 1); break; }
+                }
+            } else {
+                for (uint i = 0; i < g_mgMergedClean.items.Length; i++) {
+                    if (g_mgMergedClean.items[i].key == c.oursKey) { g_mgMergedClean.items.RemoveRange(i, 1); break; }
+                }
+            }
+            if (c.theirsBlock !is null) g_mgMergedClean.blocks.InsertLast(c.theirsBlock);
+            if (c.theirsItem !is null) g_mgMergedClean.items.InsertLast(c.theirsItem);
+            continue;
+        }
+
         if (c.section == "block") {
             if (dropOurs && c.kind != 3) {
                 for (uint i = 0; i < g_mgMergedClean.blocks.Length; i++) {
@@ -690,9 +1531,15 @@ MGManifest@ MG_FinalizeMerged() {
             if (c.resolution == 2) {
                 MG_ApplyMapInfoField(g_mgMergedClean.mapInfo, c.key, g_mgTheirsMapInfo);
             }
+        } else if (c.section == "media") {
+            g_mgMediaTakeTheirs = c.resolution == 2;
         } else if (c.section == "embedded") {
-            if (c.resolution == 2) {
-                // theirs' embedded count is not directly recoverable from summaries; keep ours (v1)
+            if (c.resolution == 2 && g_mgTheirsManifest !is null) {
+                g_mgMergedClean.embeddedEntryCount = g_mgTheirsManifest.embeddedEntryCount;
+                g_mgMergedClean.embeddedEntries.RemoveRange(0, g_mgMergedClean.embeddedEntries.Length);
+                for (uint i = 0; i < g_mgTheirsManifest.embeddedEntries.Length; i++) {
+                    g_mgMergedClean.embeddedEntries.InsertLast(g_mgTheirsManifest.embeddedEntries[i]);
+                }
             }
         }
     }
@@ -726,6 +1573,7 @@ MGLiveIndex@ MG_BuildLiveIndex(CGameCtnChallenge@ map) {
     for (uint i = 0; i < map.Blocks.Length; i++) {
         MGLiveBlock lb;
         lb.entry = MG_ToBlock(map.Blocks[i]);
+        if (MG_IsAutoBlock(lb.entry.name)) continue;
         @lb.nod = map.Blocks[i];
         ix.blocks.InsertLast(lb);
     }
@@ -738,6 +1586,7 @@ MGLiveIndex@ MG_BuildLiveIndex(CGameCtnChallenge@ map) {
         if (dupe) continue;
         MGLiveBlock lb;
         lb.entry = MG_ToBlock(nb);
+        if (MG_IsAutoBlock(lb.entry.name)) continue;
         @lb.nod = nb;
         ix.blocks.InsertLast(lb);
     }
@@ -795,11 +1644,32 @@ CGameItemModel@ MG_FindItemModel(CGameCtnChallenge@ map, const string&in name) {
         CGameCtnAnchoredObject@ a = map.AnchoredObjects[i];
         if (a.ItemModel !is null && a.ItemModel.Id.GetName() == name) return a.ItemModel;
     }
-    return null;
+    return MG_LoadItemModelFromFile(name);
+}
+
+// True when blocks match aside from waypoint props — keep live nod (props not re-writable).
+bool MG_BlockEqualsIgnoringWaypoint(const MGBlock&in a, const MGBlock&in b) {
+    if (a.key != b.key || a.name != b.name) return false;
+    if (a.isFree != b.isFree || a.isGhost != b.isGhost || a.isGround != b.isGround) return false;
+    if (a.cx != b.cx || a.cy != b.cy || a.cz != b.cz) return false;
+    if (a.direction != b.direction || a.variant != b.variant || a.subVariant != b.subVariant) return false;
+    if (a.color != b.color || a.lmQual != b.lmQual) return false;
+    if (a.hasFree != b.hasFree) return false;
+    if (a.hasFree && (!MG_Vec3Eq(a.freePos, b.freePos) || !MG_Vec3Eq(a.freeRot, b.freeRot))) return false;
+    if (a.hasSkin != b.hasSkin) return false;
+    return true;
+}
+
+bool MG_ItemEqualsIgnoringWaypoint(const MGItem&in a, const MGItem&in b) {
+    if (a.key != b.key || a.itemModel != b.itemModel) return false;
+    if (!MG_Vec3Eq(a.position, b.position) || !MG_Vec3Eq(a.rotation, b.rotation)) return false;
+    if (a.scale != b.scale || a.color != b.color || a.lmQual != b.lmQual) return false;
+    return true;
 }
 
 // Transforms the live map into `final`: deletes/removes/places via E++, sets mapInfo.
-bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
+bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ finalAll) {
+    MGManifest@ final = MG_WithoutAutoBlocks(finalAll);
     MGLiveIndex@ live = MG_BuildLiveIndex(map);
     MGBlockIndex@ finalB = MGBlockIndex(final.blocks);
     MGItemIndex@ finalI = MGItemIndex(final.items);
@@ -812,9 +1682,14 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
             blocksToDelete.InsertLast(live.blocks[i].nod);
             continue;
         }
-        if (!MG_BlockEquals(live.blocks[i].entry, finalB.src[finalB.IndexOf(key)])) {
-            blocksToDelete.InsertLast(live.blocks[i].nod);
+        MGBlock@ fb = finalB.src[finalB.IndexOf(key)];
+        if (MG_BlockEquals(live.blocks[i].entry, fb)) continue;
+        if (MG_BlockEqualsIgnoringWaypoint(live.blocks[i].entry, fb)) {
+            // Only waypoint props differ — preserve live block (props not re-applicable).
+            MG_Log("merge apply: preserving waypoint block '" + fb.name + "' in place");
+            continue;
         }
+        blocksToDelete.InsertLast(live.blocks[i].nod);
     }
     for (uint i = 0; i < final.blocks.Length; i++) {
         MGBlock@ fb = final.blocks[i];
@@ -822,8 +1697,9 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
         live.blockByKey.Get(fb.key, liveIx);
         if (liveIx < 0) {
             blocksToPlace.InsertLast(fb);
-        } else if (!MG_BlockEquals(live.blocks[liveIx].entry, fb)) {
-            blocksToPlace.InsertLast(fb); // replacement (ours' nod already queued for deletion)
+        } else if (!MG_BlockEquals(live.blocks[liveIx].entry, fb) &&
+                   !MG_BlockEqualsIgnoringWaypoint(live.blocks[liveIx].entry, fb)) {
+            blocksToPlace.InsertLast(fb);
         }
     }
 
@@ -835,9 +1711,13 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
             itemsToDelete.InsertLast(live.items[i].nod);
             continue;
         }
-        if (!MG_ItemEquals(live.items[i].entry, finalI.src[finalI.IndexOf(key)])) {
-            itemsToDelete.InsertLast(live.items[i].nod);
+        MGItem@ fi = finalI.src[finalI.IndexOf(key)];
+        if (MG_ItemEquals(live.items[i].entry, fi)) continue;
+        if (MG_ItemEqualsIgnoringWaypoint(live.items[i].entry, fi)) {
+            MG_Log("merge apply: preserving waypoint item '" + fi.itemModel + "' in place");
+            continue;
         }
+        itemsToDelete.InsertLast(live.items[i].nod);
     }
     for (uint i = 0; i < final.items.Length; i++) {
         MGItem@ fi = final.items[i];
@@ -845,7 +1725,8 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
         live.itemByKey.Get(fi.key, liveIx);
         if (liveIx < 0) {
             itemsToPlace.InsertLast(fi);
-        } else if (!MG_ItemEquals(live.items[liveIx].entry, fi)) {
+        } else if (!MG_ItemEquals(live.items[liveIx].entry, fi) &&
+                   !MG_ItemEqualsIgnoringWaypoint(live.items[liveIx].entry, fi)) {
             itemsToPlace.InsertLast(fi);
         }
     }
@@ -870,14 +1751,14 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
         array<Editor::BlockSpec@> specs;
         for (uint i = 0; i < blocksToPlace.Length; i++) {
             MGBlock@ e = blocksToPlace[i];
-            CGameCtnBlockInfo@ info = Editor::GetInventoryBlockInfoByName(e.name);
+            CGameCtnBlockInfo@ info = MG_ResolveBlockInfo(e.name);
             if (info is null) {
                 MG_Log("merge apply: unknown block '" + e.name + "' (key " + e.key + ") — skipped");
                 continue;
             }
             Editor::BlockSpec@ spec;
             if (e.isFree) {
-                vec3 pos = e.freePos + vec3(0, g_mgWorldBaseY, 0);        // back to E++ memory space
+                vec3 pos = e.freePos + vec3(0, g_mgFreeMemOffsetY, 0);        // back to E++ memory space
                 vec3 pyr = vec3(e.freeRot.y, e.freeRot.x, e.freeRot.z); // back to (pitch, yaw, roll)
                 @spec = Editor::MakeBlockSpec(info, pos, pyr);
                 spec.isGhost = e.isGhost;
@@ -890,10 +1771,7 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
             spec.lmQual = CGameCtnBlock::EMapElemLightmapQuality(MG_LmValue(e.lmQual));
             spec.variant = e.variant; // BlockSpec's settable variant (mobilIx is read-only on the exported spec)
             if (e.hasWaypointProps) {
-                MG_Log("merge apply: WARNING - waypoint props on '" + e.name + "' are not re-applied (v1)");
-            }
-            if (e.hasSkin) {
-                MG_Log("merge apply: WARNING - skin on '" + e.name + "' is not re-applied (v1)");
+                MG_Log("merge apply: NOTE - waypoint props on '" + e.name + "' are not re-writable; model placed");
             }
             specs.InsertLast(spec);
         }
@@ -901,6 +1779,7 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
             MG_Log("merge apply: PlaceBlocks failed");
             return false;
         }
+        MG_ApplySkinsAfterPlace(map, blocksToPlace);
     }
 
     if (itemsToPlace.Length > 0) {
@@ -946,13 +1825,22 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ final) {
 string g_mgMergeSecondParent = ""; // consumed by MG_CommitCoro (two-parent merge commit)
 
 void MG_ClearMergeState() {
+    // Drop any temporary ghost/item previews before wiping conflict list.
+    if (g_mgConflicts.Length > 0) MG_ClearConflictPreviews();
     g_mgMergeActive = false;
     g_mgConflicts.RemoveRange(0, g_mgConflicts.Length);
     g_mgAppliedChanges.RemoveRange(0, g_mgAppliedChanges.Length);
     @g_mgMergedClean = null;
     @g_mgTheirsMapInfo = null;
+    @g_mgTheirsManifest = null;
+    g_mgMediaTakeTheirs = false;
     g_mgMergeStatus = "";
     g_mgMarkersLogged = false;
+    g_mgMergePendingRemoteGit = "";
+    g_mgConflictFocus = 0;
+    g_mgShowAllConflicts = false;
+    g_mgViewMode = 0;
+    g_mgLastCamTarget = vec3(-99999, -99999, -99999);
 }
 
 bool MG_RestoreOursBlob(CGameCtnChallenge@ map, const string&in repoDir, const string&in oursTip) {
@@ -1002,39 +1890,78 @@ void MG_MergeWork() {
 }
 
 void MG_MergeWorkInner() {
-    g_mgMergeStatus = "combining...";
-    MG_CalibrateWorldSpace(GetMap());
     CGameCtnChallenge@ map = GetMap();
     if (map is null) { MG_Log("merge: no map open"); g_mgRepoBusy = false; g_mgMergeStatus = "no map"; return; }
-    if (g_mgMergeSel < 0 || g_mgMergeSel >= int(g_mgBranches.Length)) {
+    MG_RebuildMergeSources();
+    if (g_mgMergeSel < 0 || g_mgMergeSel >= int(g_mgMergeSources.Length)) {
         MG_Log("merge: pick a source version line first"); g_mgRepoBusy = false; return;
     }
-    string source = g_mgBranches[g_mgMergeSel];
-    string mapFile = MG_MapFileOf(map);
-    string repoDir = MG_ReposRoot() + "/" + MG_RepoIdFor(mapFile);
+    string source = g_mgMergeSources[g_mgMergeSel];
+    string repoDir = MG_ReposRoot() + "/" + MG_RepoIdFor(MG_MapFileOf(map));
     string oursBranch = MG_CurrentBranch(repoDir);
     if (source == oursBranch) { MG_Log("merge: source is the current version line"); g_mgRepoBusy = false; return; }
     string oursTip = MG_TipSha(repoDir, oursBranch);
-    string theirsTip = MG_TipSha(repoDir, source);
+    string theirsTip = source.StartsWith("origin/")
+        ? GH_OriginTipSha(repoDir, source.SubStr(7))
+        : MG_TipSha(repoDir, source);
+    MG_MergeFromTips(repoDir, oursTip, theirsTip, source, oursBranch, false, "");
+}
+
+// Tip-based merge entry used by branch UI and remote Update/Share diverge path.
+void MG_MergeFromTips(const string&in repoDir, const string&in oursTip, const string&in theirsTip,
+                      const string&in sourceLabel, const string&in oursBranch,
+                      bool pushAfter, const string&in pendingRemoteGit) {
+    g_mgRepoBusy = true;
+    g_mgMergeStatus = "combining...";
+    g_mgMergePushAfter = pushAfter;
+    g_mgMergePendingRemoteGit = pendingRemoteGit;
+    MG_CalibrateWorldSpace(GetMap());
+    CGameCtnChallenge@ map = GetMap();
+    if (map is null) { MG_Log("merge: no map open"); g_mgRepoBusy = false; g_mgMergeStatus = "no map"; return; }
     if (oursTip.Length == 0 || theirsTip.Length == 0) {
-        MG_Log("merge: both version lines need commits first"); g_mgRepoBusy = false; return;
+        MG_Log("merge: both sides need commits first"); g_mgRepoBusy = false; g_mgMergeStatus = "missing tips"; return;
+    }
+    if (oursTip == theirsTip) {
+        MG_Log("merge: already the same tip"); g_mgRepoBusy = false; g_mgMergeStatus = "already up to date"; return;
     }
     string baseSha = MG_MergeBase(repoDir, oursTip, theirsTip);
     if (baseSha.Length == 0) {
-        MG_Log("merge: no common ancestor between '" + oursBranch + "' and '" + source + "'");
+        MG_Log("merge: no common ancestor between local and '" + sourceLabel + "'");
         g_mgRepoBusy = false; g_mgMergeStatus = "no common base";
         return;
     }
     if (baseSha == oursTip) {
-        MG_Log("merge: '" + source + "' already contains everything on '" + oursBranch +
-               "' (it was created after your latest commit) — there is nothing to combine. " +
-               "Switch to '" + source + "' to get its changes (fast-forward).");
-        g_mgMergeStatus = "'" + source + "' is ahead - nothing to combine (Switch instead)";
+        // Theirs is a fast-forward of ours — move branch tip to theirs and restore.
+        MG_Log("merge: fast-forward to '" + sourceLabel + "'");
+        MG_WriteTextFile(repoDir + "/refs/heads/" + oursBranch, theirsTip);
+        g_mgRepoTip = theirsTip;
+        string p, m, b, a, msg; int64 t;
+        if (MG_ReadCommit(repoDir, theirsTip, p, m, b, a, msg, t)) {
+            CSystemFidFile@ mapFid = map.MapInfo.Fid;
+            string mapPath;
+            if (mapFid !is null) { mapPath = mapFid.FullFileName; }
+            else { mapPath = IO::FromUserGameFolder(MG_MapFileOf(map)); }
+            MG_InstallCustomFilesFor(repoDir, theirsTip); // loaded when the map reopens
+            try { MG_CopyFile(repoDir + "/objects/blobs/" + b + ".gbx", mapPath); } catch { }
+            if (Permissions::OpenAdvancedMapEditor()) {
+                string mapFile = MG_MapFileOf(map);
+                auto app = cast<CGameManiaPlanet>(GetApp());
+                app.BackToMainMenu();
+                while (!app.ManiaTitleControlScriptAPI.IsReady) yield();
+                while (app.Switcher.ModuleStack.Length < 1 || cast<CTrackManiaMenus>(app.Switcher.ModuleStack[0]) is null) yield();
+                yield();
+                app.ManiaTitleControlScriptAPI.EditMap(mapFile, "", "");
+                uint waited = 0;
+                while (GetMap() is null && waited < 3000) { yield(); waited++; }
+            }
+        }
+        if (pendingRemoteGit.Length > 0) GH_WriteRemoteState(repoDir, oursBranch, theirsTip, pendingRemoteGit);
+        g_mgMergeStatus = "fast-forwarded to '" + sourceLabel + "'";
         g_mgRepoBusy = false;
+        if (pushAfter) GH_PushCoro();
         return;
     }
 
-    // clean check: live manifest must match ours' tip
     MG_Log("merge: checking for uncommitted changes...");
     MGManifest@ oursMan = MG_BuildManifest(map);
     string tmp = IO::FromStorageFolder("merge-ours.json");
@@ -1046,20 +1973,20 @@ void MG_MergeWorkInner() {
     if (!MG_ReadCommit(repoDir, oursTip, parents, oursTipManifest, oursTipBlob, author, message, time)) {
         g_mgRepoBusy = false; return;
     }
-    if (oursLiveSha != oursTipManifest) {
+    if (oursLiveSha != oursTipManifest || MG_MediaChangedSince(map, repoDir, oursTip, false)) {
         g_mgMergeStatus = "merge refused: uncommitted changes (save a version first)";
         MG_Log("merge: " + g_mgMergeStatus);
         g_mgRepoBusy = false;
         return;
     }
 
-    // load theirs + base manifests (capture theirs' manifest sha before reusing the out vars)
     string p2, m2, b2, a2, msg2;
     int64 t2;
     if (!MG_ReadCommit(repoDir, theirsTip, p2, m2, b2, a2, msg2, t2)) {
         MG_Log("merge: theirs commit unreadable"); g_mgRepoBusy = false; return;
     }
     string theirsManifestSha = m2;
+    string theirsBlobSha = b2;
     if (!MG_ReadCommit(repoDir, baseSha, p2, m2, b2, a2, msg2, t2)) {
         MG_Log("merge: base commit unreadable"); g_mgRepoBusy = false; return;
     }
@@ -1069,36 +1996,72 @@ void MG_MergeWorkInner() {
         MG_Log("merge: stored manifests unreadable"); g_mgRepoBusy = false; return;
     }
 
-    // merge state
+    // Custom items: install the files their version shared, then make sure every item
+    // they placed can be found before anything in the map is touched.
+    array<string>@ installedItems = MG_InstallCustomFilesFor(repoDir, theirsTip);
+    if (installedItems.Length > 0) {
+        try { Editor::ReloadItemsAsync(installedItems); } catch {
+            MG_Log("items: reloading new items failed: " + getExceptionInfo());
+        }
+    }
+    MG_EnsureTheirsEmbeddedAvailable(repoDir, theirsBlobSha, theirsMan);
+    array<string>@ missingItems = MG_MissingCustomItems(map, theirsMan);
+    if (missingItems.Length > 0) {
+        string names = "";
+        for (uint i = 0; i < missingItems.Length && i < 3; i++) names += (i > 0 ? ", " : "") + MG_PrettyName(missingItems[i]);
+        if (missingItems.Length > 3) names += " and " + (missingItems.Length - 3) + " more";
+        if (installedItems.Length > 0) {
+            g_mgMergeStatus = "new custom items were installed — reopen the map, then Update again";
+        } else {
+            g_mgMergeStatus = "their version uses custom items you don't have (" + names +
+                              ") — ask them to Share again with the latest MapGit, or send you the files";
+        }
+        MG_Log("merge: stopped before changing your map: " + g_mgMergeStatus);
+        UI::ShowNotification("MapGit", g_mgMergeStatus);
+        g_mgRepoBusy = false;
+        return;
+    }
+
     MG_ClearMergeState();
+    g_mgMergePushAfter = pushAfter;
+    g_mgMergePendingRemoteGit = pendingRemoteGit;
+    g_mgAutoBlockCache.DeleteAll();
+    g_mgStartCache.DeleteAll();
+    MG_AlignSharedCellKeys(baseMan, oursMan, theirsMan);
     @g_mgMergedClean = MGManifest();
     @g_mgMergedClean.mapInfo = oursMan.mapInfo;
     for (uint i = 0; i < oursMan.blocks.Length; i++) g_mgMergedClean.blocks.InsertLast(oursMan.blocks[i]);
     for (uint i = 0; i < oursMan.items.Length; i++) g_mgMergedClean.items.InsertLast(oursMan.items[i]);
     g_mgMergedClean.embeddedEntryCount = oursMan.embeddedEntryCount;
+    for (uint i = 0; i < oursMan.embeddedEntries.Length; i++) {
+        g_mgMergedClean.embeddedEntries.InsertLast(oursMan.embeddedEntries[i]);
+    }
     @g_mgTheirsMapInfo = theirsMan.mapInfo;
+    @g_mgTheirsManifest = theirsMan;
     g_mgMergeRepoDir = repoDir;
     g_mgMergeBranch = oursBranch;
-    g_mgMergeSource = source;
+    g_mgMergeSource = sourceLabel;
     g_mgMergeOursTip = oursTip;
     g_mgMergeTheirsTip = theirsTip;
     g_mgMergeBaseSha = baseSha;
 
     yield();
     MG_RunMerge(baseMan, oursMan, theirsMan);
+    MG_EnforceSingleStart(oursMan);
+    MG_MergeMedia(repoDir, baseSha, oursTip, theirsTip);
 
     if (g_mgConflicts.Length > 0) {
         g_mgMergeActive = true;
-        g_mgMergeStatus = g_mgConflicts.Length + " conflicts — resolve below, then apply";
+        g_mgMergeStatus = g_mgConflicts.Length + " conflicts — resolve in the world, then apply";
         MG_Log("merge: " + g_mgMergeStatus);
+        MG_PlaceConflictPreviews();
         g_mgRepoBusy = false;
         return;
     }
 
-    // clean merge: continue straight into apply + two-parent commit
     g_mgMergeActive = true;
     g_mgMergeStatus = "clean — applying " + g_mgAppliedChanges.Length + " changes...";
-    MG_Log("merge: clean — " + g_mgAppliedChanges.Length + " changes from '" + source + "'");
+    MG_Log("merge: clean — " + g_mgAppliedChanges.Length + " changes from '" + sourceLabel + "'");
     g_mgRepoBusy = false;
     MG_ApplyMergeWork();
 }
@@ -1118,44 +2081,86 @@ void MG_ApplyMergeWork() {
         g_mgRepoBusy = false;
         return;
     }
+    int starts = MG_CountStarts(final);
+    if (starts > 1 && starts > g_mgOursStartCount) {
+        g_mgMergeStatus = "the combined map would have " + starts + " starts — pick one";
+        MG_Log("merge apply: refused — combined map would have " + starts + " start lines");
+        g_mgRepoBusy = false;
+        return;
+    }
+
+    // Remove temporary ghost/item previews before the real apply so they are not
+    // part of the live index or the merge commit.
+    MG_ClearConflictPreviews();
 
     if (!MG_ApplyMerged(map, final)) {
         MG_Log("merge apply: apply step failed — restoring");
         MG_RestoreOursBlob(map, g_mgMergeRepoDir, g_mgMergeOursTip);
         MG_ClearMergeState();
+        g_mgMergePushAfter = false;
         g_mgRepoBusy = false;
         return;
     }
+    if (g_mgMediaTakeTheirs) {
+        string tp, tm, tb, ta, tmsg;
+        int64 tt;
+        bool tookMedia = false;
+        if (MG_ReadCommit(g_mgMergeRepoDir, g_mgMergeTheirsTip, tp, tm, tb, ta, tmsg, tt)) {
+            tookMedia = MG_ApplyTheirsMedia(map, g_mgMergeRepoDir + "/objects/blobs/" + tb + ".gbx", tb);
+        }
+        if (!tookMedia) {
+            UI::ShowNotification("MapGit", "Couldn't bring in their MediaTracker clips — yours were kept.");
+        }
+    }
     yield();
 
-    // verification invariant: rebuilt manifest must hash-match the computed merge
-    MGManifest@ rebuilt = MG_BuildManifest(map);
+    MGManifest@ rebuilt = MG_WithoutAutoBlocks(MG_BuildManifest(map));
+    MGManifest@ expected = MG_WithoutAutoBlocks(final);
     string tmpR = IO::FromStorageFolder("merge-verify-rebuilt.json");
     MG_WriteManifest(rebuilt, tmpR);
     string tmpF = IO::FromStorageFolder("merge-verify-final.json");
-    MG_WriteManifest(final, tmpF);
+    MG_WriteManifest(expected, tmpF);
     yield();
     string hashR = MG_Sha256File(tmpR);
     string hashF = MG_Sha256File(tmpF);
     if (hashR != hashF) {
         MG_Log("merge apply: VERIFICATION FAILED (rebuilt " + MG_Short(hashR) + " != expected " + MG_Short(hashF) +
                ") — restoring. Rebuilt: " + rebuilt.blocks.Length + " blocks / " + rebuilt.items.Length +
-               " items; expected: " + final.blocks.Length + " / " + final.items.Length);
+               " items; expected: " + expected.blocks.Length + " / " + expected.items.Length);
         MG_RestoreOursBlob(map, g_mgMergeRepoDir, g_mgMergeOursTip);
         MG_ClearMergeState();
+        g_mgMergePushAfter = false;
         g_mgRepoBusy = false;
         g_mgMergeStatus = "verification failed — restored";
         return;
     }
     MG_Log("merge apply: verified (" + MG_Short(hashR) + ")");
 
-    // two-parent merge commit via the standard commit flow
     g_mgMergeSecondParent = g_mgMergeTheirsTip;
     g_mgCommitMsg = T("Combined '", "Merge '") + g_mgMergeSource + T("' into '", "' into '") + g_mgMergeBranch + "'";
     string srcBranch = g_mgMergeSource;
+    string repoDir = g_mgMergeRepoDir;
+    string branch = g_mgMergeBranch;
+    string pendingGit = g_mgMergePendingRemoteGit;
+    bool pushAfter = g_mgMergePushAfter;
     MG_ClearMergeState();
     g_mgMergeStatus = "merged '" + srcBranch + "'";
     MG_CommitCoro();
+
+    // Advance sync bookkeeping after a successful merge commit when we know the remote git tip.
+    if (pendingGit.Length > 0) {
+        string tip = MG_TipSha(repoDir, branch);
+        if (tip.Length > 0) GH_WriteRemoteState(repoDir, branch, tip, pendingGit);
+    }
+    g_mgRemoteSentence = "";
+    g_mgNotifiedRemoteGit = "";
+
+    if (pushAfter) {
+        g_mgRepoBusy = false;
+        GH_PushCoro();
+    } else {
+        g_mgRepoBusy = false;
+    }
 }
 
 // ------------------------- merge UI -------------------------
@@ -1165,30 +2170,78 @@ void MG_ResolutionButton(MGMergeConflict@ c, int res, const string&in label) {
     if (active) UI::BeginDisabled();
     if (UI::Button(label + "##c" + c.key + res)) {
         c.resolution = res;
+        int next = MG_NextUnresolvedConflict(g_mgConflictFocus);
+        if (next >= 0 && g_mgConflicts[g_mgConflictFocus].resolution != 0) MG_SetConflictFocus(next);
+        else MG_RefreshConflictPreviews();
     }
     if (active) UI::EndDisabled();
+}
+
+array<string> g_mgMergeSources; // branches + optional origin/<branch>
+
+void MG_RebuildMergeSources() {
+    g_mgMergeSources.RemoveRange(0, g_mgMergeSources.Length);
+    for (uint i = 0; i < g_mgBranches.Length; i++) g_mgMergeSources.InsertLast(g_mgBranches[i]);
+    CGameCtnChallenge@ map = GetMap();
+    if (map is null) return;
+    string repoDir = MG_ReposRoot() + "/" + MG_RepoIdFor(MG_MapFileOf(map));
+    string branch = MG_CurrentBranch(repoDir);
+    string originTip = GH_OriginTipSha(repoDir, branch);
+    string localTip = MG_TipSha(repoDir, branch);
+    if (originTip.Length > 0 && originTip != localTip) {
+        string originOpt = "origin/" + branch;
+        bool have = false;
+        for (uint i = 0; i < g_mgMergeSources.Length; i++) {
+            if (g_mgMergeSources[i] == originOpt) { have = true; break; }
+        }
+        if (!have) g_mgMergeSources.InsertLast(originOpt);
+    }
+}
+
+void MG_MergeOriginCoro() {
+    if (g_mgRepoBusy) return;
+    startnew(MG_MergeOriginWork);
+}
+
+void MG_MergeOriginWork() {
+    g_mgRepoBusy = true;
+    try {
+        CGameCtnChallenge@ map = GetMap();
+        if (map is null) { g_mgRepoBusy = false; return; }
+        string repoDir = MG_ReposRoot() + "/" + MG_RepoIdFor(MG_MapFileOf(map));
+        string branch = MG_CurrentBranch(repoDir);
+        MG_MergeFromTips(repoDir, MG_TipSha(repoDir, branch), GH_OriginTipSha(repoDir, branch),
+                         "origin/" + branch, branch, false, "");
+    } catch {
+        MG_Log("merge: EXCEPTION - " + getExceptionInfo());
+        MG_ClearMergeState();
+        g_mgRepoBusy = false;
+    }
 }
 
 void RenderMergeSection() {
     UI::Separator();
     UI::Text(T("Combine version lines", "Merge") + ":");
     if (!g_mgMergeActive) {
-        if (g_mgBranches.Length > 1) {
-            if (g_mgMergeSel < 0 || g_mgMergeSel >= int(g_mgBranches.Length)) g_mgMergeSel = 0;
-            if (UI::BeginCombo("##mg-merge-src", g_mgBranches[g_mgMergeSel])) {
-                for (uint i = 0; i < g_mgBranches.Length; i++) {
-                    if (UI::Selectable(g_mgBranches[i], int(i) == g_mgMergeSel)) {
-                        g_mgMergeSel = int(i);
-                    }
+        MG_RebuildMergeSources();
+        if (g_mgMergeSources.Length > 1) {
+            if (g_mgMergeSel < 0 || g_mgMergeSel >= int(g_mgMergeSources.Length)) g_mgMergeSel = 0;
+            if (UI::BeginCombo("##mg-merge-src", g_mgMergeSources[g_mgMergeSel])) {
+                for (uint i = 0; i < g_mgMergeSources.Length; i++) {
+                    if (UI::Selectable(g_mgMergeSources[i], int(i) == g_mgMergeSel)) g_mgMergeSel = int(i);
                 }
                 UI::EndCombo();
             }
             UI::BeginDisabled(g_mgRepoBusy);
             UI::SameLine();
-            if (UI::Button(T("Combine", "Merge"))) MG_MergeCoro();
+            if (UI::Button(T("Combine", "Merge"))) {
+                string src = g_mgMergeSources[g_mgMergeSel];
+                if (src.StartsWith("origin/")) MG_MergeOriginCoro();
+                else MG_MergeCoro();
+            }
             UI::EndDisabled();
         } else {
-            UI::TextDisabled("  (create a second version line above to combine)");
+            UI::TextDisabled("  (create a second version line above, or Update to fetch origin)");
         }
     } else {
         if (g_mgMergeStatus.Length > 0) UI::Text(g_mgMergeStatus);
@@ -1197,31 +2250,46 @@ void RenderMergeSection() {
             for (uint i = 0; i < g_mgConflicts.Length; i++) {
                 if (g_mgConflicts[i].resolution == 0) { allResolved = false; break; }
             }
+            bool showAll = UI::Checkbox("Show all conflicts at once", g_mgShowAllConflicts);
+            MG_SetShowAllConflicts(showAll);
+            UI::SameLine();
+            RenderConflictViewModeButtons();
             for (uint i = 0; i < g_mgConflicts.Length; i++) {
                 MGMergeConflict@ c = g_mgConflicts[i];
-                UI::Text("  - " + MG_KindName(c.kind) + "  " + c.key +
-                         "   [ours: " + c.oursSummary + "  theirs: " + c.theirsSummary + "]");
+                bool focused = int(i) == g_mgConflictFocus;
+                UI::Text((focused ? "\\$ff0> " : "  ") + "#" + (i + 1) + " " + MG_KindName(c.kind) + "  " + c.key +
+                         "   [ours: " + c.oursSummary + "  theirs: " + c.theirsSummary + "]" +
+                         (c.previewPlaced ? " \\$8f0[model]" : (c.previewFallback ? " \\$f84[wireframe]" : "")));
                 if (c.hasOursPos) {
                     UI::SameLine();
-                    if (UI::Button("\\$0f2go ours##o" + i)) MG_JumpCamera(c.oursPos);
-                    if (UI::IsItemHovered()) UI::SetTooltip("Ours (green box in the world): " + c.oursSummary);
+                    if (UI::Button("\\$0f2go ours##o" + i)) {
+                        if (!focused) MG_SetConflictFocus(int(i));
+                        g_mgLastCamTarget = vec3(-99999, -99999, -99999);
+                        MG_JumpCamera(c.oursPos);
+                    }
+                    if (UI::IsItemHovered()) UI::SetTooltip("Ours (green outline): " + c.oursSummary);
                 }
                 if (c.hasTheirsPos) {
                     UI::SameLine();
-                    if (UI::Button("\\$f42go theirs##t" + i)) MG_JumpCamera(c.theirsPos);
-                    if (UI::IsItemHovered()) UI::SetTooltip("Theirs (red ghost box): " + c.theirsSummary +
-                        " — not placed yet; it only exists on the other version line");
+                    if (UI::Button("\\$f42go theirs##t" + i)) {
+                        if (!focused) MG_SetConflictFocus(int(i));
+                        g_mgLastCamTarget = vec3(-99999, -99999, -99999);
+                        MG_JumpCamera(c.theirsPos);
+                    }
+                    if (UI::IsItemHovered()) UI::SetTooltip("Theirs (red ghost model or wireframe): " + c.theirsSummary);
                 }
                 UI::SameLine();
                 MG_ResolutionButton(c, 1, "Ours");
                 UI::SameLine();
                 MG_ResolutionButton(c, 2, "Theirs");
-                if (c.kind == 0 || c.kind == 1) {
+                if ((c.kind == 0 || c.kind == 1) && !MG_ConflictHasStart(c)) {
                     UI::SameLine();
                     MG_ResolutionButton(c, 3, "Both");
                 }
-                UI::SameLine();
-                MG_ResolutionButton(c, 4, "None");
+                if (c.kind != 6) {
+                    UI::SameLine();
+                    MG_ResolutionButton(c, 4, "None");
+                }
                 if (c.resolution != 0) {
                     UI::SameLine();
                     UI::TextDisabled("-> " + (c.resolution == 1 ? "ours" : c.resolution == 2 ? "theirs" :
@@ -1233,7 +2301,9 @@ void RenderMergeSection() {
             UI::EndDisabled();
             UI::SameLine();
             if (UI::Button("Abort") && !g_mgRepoBusy) {
+                MG_ClearConflictPreviews();
                 MG_ClearMergeState();
+                g_mgMergePushAfter = false;
             }
         }
         if (g_mgAppliedChanges.Length > 0 && g_mgConflicts.Length == 0) {
