@@ -198,41 +198,50 @@ void MG_LoadLog(const string&in repoDir, const string&in tip) {
 
 void MG_RefreshStatusCoro() {
     g_mgRepoBusy = true;
-    CGameCtnChallenge@ map = GetMap();
-    if (map is null) { g_mgRepoStatusText = "no map open"; g_mgRepoBusy = false; return; }
-    string mapFile = MG_MapFileOf(map);
-    g_mgRepoId = MG_RepoIdFor(mapFile);
-    string repoDir = MG_ReposRoot() + "/" + g_mgRepoId;
-    MG_EnsureRepo(repoDir, g_mgRepoId, mapFile, map.MapName);
-    g_mgRepoBranch = MG_CurrentBranch(repoDir);
-    g_mgRepoTip = MG_TipSha(repoDir, g_mgRepoBranch);
-    MG_LoadBranches(repoDir);
+    try {
+        CGameCtnChallenge@ map = GetMap();
+        if (map is null || map.MapInfo is null) { g_mgRepoStatusText = "no map open"; g_mgRepoBusy = false; return; }
+        string mapFile = MG_MapFileOf(map);
+        g_mgRepoId = MG_RepoIdFor(mapFile);
+        string repoDir = MG_ReposRoot() + "/" + g_mgRepoId;
+        MG_EnsureRepo(repoDir, g_mgRepoId, mapFile, map.MapName);
+        g_mgRepoBranch = MG_CurrentBranch(repoDir);
+        g_mgRepoTip = MG_TipSha(repoDir, g_mgRepoBranch);
+        MG_LoadBranches(repoDir);
 
-    yield();
-    MGManifest@ m = MG_BuildManifest(map);
-    string tmp = IO::FromStorageFolder("status-manifest.json");
-    MG_WriteManifest(m, tmp);
-    yield();
-    string msha = MG_Sha256File(tmp);
+        yield();
+        // Re-check after yield in case the editor closed or reloaded mid-frame.
+        @map = GetMap();
+        if (map is null || map.MapInfo is null) { g_mgRepoBusy = false; return; }
+        MGManifest@ m = MG_BuildManifest(map);
+        string tmp = IO::FromStorageFolder("status-manifest.json");
+        MG_WriteManifest(m, tmp);
+        yield();
+        string msha = MG_Sha256File(tmp);
 
-    if (g_mgRepoTip.Length == 0) {
-        g_mgRepoStatusText = "no commits yet (unborn HEAD) — first commit pending";
-        g_mgRepoLogLines.RemoveRange(0, g_mgRepoLogLines.Length);
-    } else {
-        string parents, tm, tb, author, message;
-        int64 time;
-        if (MG_ReadCommit(repoDir, g_mgRepoTip, parents, tm, tb, author, message, time)) {
-            bool same = tm == msha && !MG_MediaChangedSince(map, repoDir, g_mgRepoTip, false);
-            g_mgRepoStatusText = same ? "clean (manifest matches HEAD)"
-                                              : "dirty (manifest differs from HEAD " + MG_Short(g_mgRepoTip) + ")";
-            MG_LoadLog(repoDir, g_mgRepoTip);
+        if (g_mgRepoTip.Length == 0) {
+            g_mgRepoStatusText = "no commits yet (unborn HEAD) — first commit pending";
+            g_mgRepoLogLines.RemoveRange(0, g_mgRepoLogLines.Length);
         } else {
-            g_mgRepoStatusText = "HEAD commit unreadable: " + g_mgRepoTip;
+            string parents, tm, tb, author, message;
+            int64 time;
+            if (MG_ReadCommit(repoDir, g_mgRepoTip, parents, tm, tb, author, message, time)) {
+                @map = GetMap();
+                bool mediaChanged = (map !is null) && MG_MediaChangedSince(map, repoDir, g_mgRepoTip, false);
+                bool same = tm == msha && !mediaChanged;
+                g_mgRepoStatusText = same ? "clean (manifest matches HEAD)"
+                                                  : "dirty (manifest differs from HEAD " + MG_Short(g_mgRepoTip) + ")";
+                MG_LoadLog(repoDir, g_mgRepoTip);
+            } else {
+                g_mgRepoStatusText = "HEAD commit unreadable: " + g_mgRepoTip;
+            }
         }
+        MG_Log("status: branch=" + g_mgRepoBranch + " tip=" + MG_Short(g_mgRepoTip) + " manifest=" + MG_Short(msha));
+        MG_LoadTimeline(repoDir, g_mgRepoTip); // keep the panel timeline fresh
+        MG_LoadStamps(repoDir);
+    } catch {
+        MG_Log("status: interrupted (" + getExceptionInfo() + ")");
     }
-    MG_Log("status: branch=" + g_mgRepoBranch + " tip=" + MG_Short(g_mgRepoTip) + " manifest=" + MG_Short(msha));
-    MG_LoadTimeline(repoDir, g_mgRepoTip); // keep the panel timeline fresh
-    MG_LoadStamps(repoDir);
     g_mgRepoBusy = false;
 }
 
@@ -545,6 +554,7 @@ string MG_NormalizeToMainLine(const string&in repoDir, const string&in currentBr
     return "main";
 }
 void MG_AutoLoadRepoState(CGameCtnChallenge@ map) {
+    if (g_ghBusy || map is null || map.MapInfo is null) return;
     string mapFile = MG_MapFileOf(map);
     string repoId = MG_RepoIdFor(mapFile);
     if (repoId == g_mgAutoRepoKey) return;

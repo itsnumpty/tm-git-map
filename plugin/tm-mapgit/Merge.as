@@ -702,6 +702,76 @@ array<CGameCtnBlock@> MG_PreviewCandidates(CGameCtnChallenge@ map, MGBlock@ e) {
     return res;
 }
 
+// Native PluginMapType fallback for grid blocks when Editor++'s donor macroblock
+// path fails (e.g. Wine/Proton pointer range checks rejecting valid heap addresses).
+bool MG_PlaceGridBlockNative(MGBlock@ e, bool forceRedGhost = false) {
+    if (e is null || e.isFree) return false;
+    CGameCtnEditorFree@ ed = GetEditorFree();
+    if (ed is null || ed.PluginMapType is null) return false;
+    CGameCtnBlockInfo@ info = MG_ResolveBlockInfo(e.name);
+    if (info is null) return false;
+    auto pmt = ed.PluginMapType;
+    auto prevColor = pmt.NextMapElemColor;
+    auto prevLm = pmt.NextMapElemLightmapQuality;
+    pmt.NextMapElemColor = CGameEditorPluginMap::EMapElemColor(forceRedGhost ? 4 : MG_ColorValue(e.color));
+    pmt.NextMapElemLightmapQuality = CGameEditorPluginMap::EMapElemLightmapQuality(MG_LmValue(e.lmQual));
+    int3 coord(e.cx, e.cy, e.cz);
+    auto dir = CGameEditorPluginMap::ECardinalDirections(e.direction);
+    bool ok = false;
+    if (forceRedGhost || e.isGhost) {
+        ok = pmt.PlaceGhostBlock(info, coord, dir);
+    } else if (info.IsTerrain) {
+        ok = pmt.PlaceTerrainBlocks_NoDestruction(info, coord, coord);
+        if (!ok) ok = pmt.PlaceTerrainBlocks(info, coord, coord);
+    } else {
+        ok = pmt.PlaceBlock_NoDestruction(info, coord, dir);
+        if (!ok) ok = pmt.PlaceBlock(info, coord, dir);
+    }
+    pmt.NextMapElemColor = prevColor;
+    pmt.NextMapElemLightmapQuality = prevLm;
+    return ok;
+}
+
+bool MG_PlaceGridBlocksNative(array<MGBlock@>@ blocks) {
+    for (uint i = 0; i < blocks.Length; i++) {
+        if (blocks[i] is null || blocks[i].isFree) return false;
+    }
+    for (uint i = 0; i < blocks.Length; i++) {
+        if (MG_ResolveBlockInfo(blocks[i].name) is null) continue;
+        if (!MG_PlaceGridBlockNative(blocks[i], false)) {
+            MG_Log("merge apply: native fallback failed placing '" + blocks[i].name + "'");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool MG_DeleteGridBlocksNative(array<CGameCtnBlock@>@ blocks) {
+    CGameCtnEditorFree@ ed = GetEditorFree();
+    if (ed is null || ed.PluginMapType is null) return false;
+    auto pmt = ed.PluginMapType;
+    for (uint i = 0; i < blocks.Length; i++) {
+        CGameCtnBlock@ b = blocks[i];
+        if (b is null || int(b.Coord.x) < 0) return false;
+    }
+    for (uint i = 0; i < blocks.Length; i++) {
+        CGameCtnBlock@ b = blocks[i];
+        int3 coord(int(b.Coord.x), int(b.Coord.y), int(b.Coord.z));
+        auto dir = CGameEditorPluginMap::ECardinalDirections(int(b.Direction));
+        bool ok = false;
+        if (b.IsGhostBlock() && b.BlockInfo !is null) {
+            ok = pmt.RemoveGhostBlock(b.BlockInfo, coord, dir);
+        } else if (b.BlockInfo !is null && b.BlockInfo.IsTerrain) {
+            ok = pmt.RemoveTerrainBlocks(coord, coord);
+        } else {
+            if (b.BlockInfo !is null) ok = pmt.RemoveBlockSafe(b.BlockInfo, coord, dir);
+            if (!ok) ok = pmt.RemoveBlock(coord);
+        }
+        if (!ok) return false;
+    }
+    return true;
+}
+
 bool MG_PlaceOnePreviewBlock(MGMergeConflict@ c, MGBlock@ e) {
     CGameCtnBlockInfo@ info = MG_ResolveBlockInfo(e.name);
     if (info is null) {
@@ -730,9 +800,11 @@ bool MG_PlaceOnePreviewBlock(MGMergeConflict@ c, MGBlock@ e) {
     uint before = map.Blocks.Length;
     array<CGameCtnBlock@> existing = MG_PreviewCandidates(map, e);
     if (!Editor::PlaceBlocks(specs, false)) {
-        MG_Log("preview: PlaceBlocks failed for '" + e.name + "' — wireframe fallback");
-        c.previewFallback = true;
-        return false;
+        if (e.isFree || !MG_PlaceGridBlockNative(e, true)) {
+            MG_Log("preview: PlaceBlocks failed for '" + e.name + "' — wireframe fallback");
+            c.previewFallback = true;
+            return false;
+        }
     }
     // The preview is whichever matching block wasn't there before placement.
     array<CGameCtnBlock@> after = MG_PreviewCandidates(map, e);
@@ -821,7 +893,7 @@ void MG_HideOurs(MGMergeConflict@ c) {
         Editor::BlockSpec@ spec = Editor::MakeBlockSpec(cands[0]);
         if (spec is null) return;
         array<CGameCtnBlock@> del = { cands[0] };
-        if (!Editor::DeleteBlocks(del, false)) return;
+        if (!Editor::DeleteBlocks(del, false) && !MG_DeleteGridBlocksNative(del)) return;
         g_mgHiddenOursBlocks.InsertLast(spec);
         g_mgHiddenOursBlockEntries.InsertLast(c.oursBlock);
     } else if (c.oursItem !is null) {
@@ -836,7 +908,7 @@ void MG_HideOurs(MGMergeConflict@ c) {
 
 void MG_RestoreHiddenOurs() {
     if (g_mgHiddenOursBlocks.Length > 0) {
-        if (!Editor::PlaceBlocks(g_mgHiddenOursBlocks, false)) {
+        if (!Editor::PlaceBlocks(g_mgHiddenOursBlocks, false) && !MG_PlaceGridBlocksNative(g_mgHiddenOursBlockEntries)) {
             MG_Log("preview: could not put your hidden block(s) back — use Cancel to restore your version");
         } else {
             CGameCtnChallenge@ map = GetMap();
@@ -991,9 +1063,11 @@ void MG_ClearConflictPreviews() {
         c.previewFallback = false;
     }
     if (blocks.Length > 0) {
-        try { Editor::DeleteBlocks(blocks, false); } catch {
+        bool deleted = false;
+        try { deleted = Editor::DeleteBlocks(blocks, false); } catch {
             MG_Log("preview clear: DeleteBlocks failed: " + getExceptionInfo());
         }
+        if (!deleted) MG_DeleteGridBlocksNative(blocks);
     }
     if (items.Length > 0) {
         try { Editor::DeleteItems(items, false); } catch {
@@ -1734,8 +1808,11 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ finalAll) {
 
     if (blocksToDelete.Length > 0) {
         if (!Editor::DeleteBlocks(blocksToDelete, true)) {
-            MG_Log("merge apply: DeleteBlocks failed");
-            return false;
+            MG_Log("merge apply: Editor::DeleteBlocks failed — trying native editor API");
+            if (!MG_DeleteGridBlocksNative(blocksToDelete)) {
+                MG_Log("merge apply: DeleteBlocks failed (on Linux/Proton, enable Editor++ -> General -> Reduce lower bound on pointer sizes)");
+                return false;
+            }
         }
     }
     if (itemsToDelete.Length > 0) {
@@ -1774,8 +1851,11 @@ bool MG_ApplyMerged(CGameCtnChallenge@ map, MGManifest@ finalAll) {
             specs.InsertLast(spec);
         }
         if (specs.Length > 0 && !Editor::PlaceBlocks(specs, true)) {
-            MG_Log("merge apply: PlaceBlocks failed");
-            return false;
+            MG_Log("merge apply: Editor::PlaceBlocks failed — trying native editor API");
+            if (!MG_PlaceGridBlocksNative(blocksToPlace)) {
+                MG_Log("merge apply: PlaceBlocks failed (on Linux/Proton, enable Editor++ -> General -> Reduce lower bound on pointer sizes)");
+                return false;
+            }
         }
         MG_ApplySkinsAfterPlace(map, blocksToPlace);
     }
@@ -2133,16 +2213,21 @@ void MG_ApplyMergeWork() {
     string srcBranch = g_mgMergeSource;
     string repoDir = g_mgMergeRepoDir;
     string branch = g_mgMergeBranch;
+    string theirsTip = g_mgMergeTheirsTip;
     string pendingGit = g_mgMergePendingRemoteGit;
     bool pushAfter = g_mgMergePushAfter;
     MG_ClearMergeState();
     g_mgMergeStatus = "merged '" + srcBranch + "'";
     MG_CommitCoro();
+    if (!g_mgLastCommitOk) {
+        g_mgRepoBusy = false;
+        return;
+    }
 
-    // Advance sync bookkeeping after a successful merge commit when we know the remote git tip.
-    if (pendingGit.Length > 0) {
-        string tip = MG_TipSha(repoDir, branch);
-        if (tip.Length > 0) GH_WriteRemoteState(repoDir, branch, tip, pendingGit);
+    // Record that pendingGit on GitHub corresponds to theirsTip (the remote tip we just
+    // merged in) so the push below advances GitHub incrementally with our merge commit.
+    if (pendingGit.Length > 0 && theirsTip.Length > 0) {
+        GH_WriteRemoteState(repoDir, branch, theirsTip, pendingGit);
     }
     g_mgRemoteSentence = "";
     g_mgNotifiedRemoteGit = "";

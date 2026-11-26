@@ -468,6 +468,10 @@ void GH_PushWork() {
             MG_Log("push: local commit unreadable: " + cur); g_ghBusy = false; g_ghStatus = "local store error"; return;
         }
         string[] p = parents.Split(",");
+        if (lastLocal.Length > 0 && p.Length > 1 && p[1] == lastLocal) {
+            incremental = true;
+            break;
+        }
         cur = (p.Length > 0 && p[0].Length > 0) ? p[0] : "";
     }
     if (lastLocal.Length > 0 && !incremental) {
@@ -946,7 +950,6 @@ void GH_PullWork() {
         GH_WriteRemoteState(repoDir, branch, prevLocal, remoteGit);
         g_mgRemoteSentence = "";
         g_mgNotifiedRemoteGit = "";
-        g_mgAutoRepoKey = ""; // re-check status cleanly after reopen
         MG_Log("pull: fast-forwarded '" + branch + "' to " + MG_Short(prevLocal));
 
         if (Permissions::OpenAdvancedMapEditor()) {
@@ -964,6 +967,7 @@ void GH_PullWork() {
         g_ghStatus = "pulled " + imported + " commits (" + branch + ")";
         MG_Log("pull: done — " + g_ghStatus);
         g_ghBusy = false;
+        g_mgAutoRepoKey = ""; // re-check status cleanly now that the reopened map is ready
         return;
     }
 
