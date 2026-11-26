@@ -14,7 +14,7 @@ void Main() {
     MG_LoadFonts();
     GH_LoadToken();
     if (!S_OnboardingDone) MG_OnboardingStart();
-    print("MapGit v0.2.1 loaded. Open the MapGit window from the menu bar.");
+    print("MapGit v0.2.2 loaded. Open the MapGit window from the menu bar.");
     GH_FetchLoginCoro();
     if (g_ghToken.Length > 0) {
         MG_JoinRefreshListsWork();
