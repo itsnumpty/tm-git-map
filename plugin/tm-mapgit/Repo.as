@@ -19,6 +19,7 @@ string MG_AuthorName() {
 }
 
 bool g_mgRepoBusy = false;
+bool g_mgLastCommitOk = false;
 string g_mgRepoStatusText = "status not loaded yet";
 string g_mgRepoBranch = "main";
 string g_mgRepoTip = "";
@@ -106,6 +107,18 @@ bool MG_MapIsSaved(CGameCtnChallenge@ map) {
 string MG_MapFileOf(CGameCtnChallenge@ map) {
     string f = map.MapInfo.FileName; // wstring -> string (no Replace on wstring)
     return f.Replace("\\", "/");
+}
+
+// Absolute path on disk for the open map.
+string MG_MapAbsPath(CGameCtnChallenge@ map) {
+    CSystemFidFile@ mapFid = map.MapInfo.Fid;
+    if (mapFid !is null) {
+        string full = mapFid.FullFileName;
+        if (full.Length > 0) return full;
+    }
+    string mapFile = MG_MapFileOf(map);
+    if (mapFile.StartsWith("Maps/")) return IO::FromUserGameFolder(mapFile);
+    return IO::FromUserGameFolder("Maps/" + mapFile);
 }
 
 void MG_EnsureRepo(const string&in repoDir, const string&in repoId, const string&in mapFile, const string&in mapName) {
@@ -225,6 +238,7 @@ void MG_RefreshStatusCoro() {
 
 void MG_CommitCoro() {
     g_mgRepoBusy = true;
+    g_mgLastCommitOk = false;
     CGameCtnChallenge@ map = GetMap();
     if (map is null) { MG_Log("commit: no map open"); g_mgRepoBusy = false; return; }
     if (!MG_MapIsSaved(map)) {
@@ -234,6 +248,7 @@ void MG_CommitCoro() {
         return;
     }
     string mapFile = MG_MapFileOf(map);
+    string mapPath = MG_MapAbsPath(map);
     string repoId = MG_RepoIdFor(mapFile);
     string repoDir = MG_ReposRoot() + "/" + repoId;
     MG_EnsureRepo(repoDir, repoId, mapFile, map.MapName);
@@ -243,32 +258,58 @@ void MG_CommitCoro() {
     // the manifest honestly records null then; never restore them.
     CGameCtnEditorFree@ ed = GetEditorFree();
     if (ed is null) { MG_Log("commit: editor not open"); g_mgRepoBusy = false; return; }
-    bool saved = Editor::SaveMapSameName(ed);
-    MG_Log("commit: SaveMapSameName -> " + (saved ? "true" : "false"));
-    if (!saved) { g_mgRepoBusy = false; return; }
-    yield();
 
-    // 2) manifest snapshot
+    int64 mtimeBefore = IO::FileExists(mapPath) ? IO::FileModifiedTime(mapPath) : 0;
+    string bshaBefore = IO::FileExists(mapPath) ? MG_Sha256File(mapPath) : "";
+
+    // Wait for the editor to be ready so PluginMapType.SaveMap isn't dropped.
+    for (uint w = 0; w < 120 && ed.PluginMapType !is null && !ed.PluginMapType.IsEditorReadyForRequest; w++) yield();
+
+    bool saved = Editor::SaveMapSameName(ed);
+    MG_Log("commit: SaveMapSameName -> " + (saved ? "true" : "false") + " (" + mapPath + ")");
+    if (!saved) { g_mgRepoBusy = false; return; }
+
+    // SaveMap writes the .Map.Gbx asynchronously: wait for the editor request to
+    // finish AND for the file on disk to actually change before hashing/copying it.
+    yield(); yield();
+    for (uint w = 0; w < 300 && ed.PluginMapType !is null && !ed.PluginMapType.IsEditorReadyForRequest; w++) yield();
+
+    string bsha = "";
+    for (uint w = 0; w < 180; w++) {
+        if (IO::FileExists(mapPath)) {
+            int64 mt = IO::FileModifiedTime(mapPath);
+            if (mt != mtimeBefore || (w % 15 == 14) || bshaBefore.Length == 0) {
+                if (mt != mtimeBefore) { yield(); yield(); } // let the write settle
+                try {
+                    string h = MG_Sha256File(mapPath);
+                    if (h.Length > 0 && h != bshaBefore) { bsha = h; break; }
+                } catch { } // file may still be held open while writing
+            }
+        }
+        yield();
+    }
+    if (bsha.Length == 0 && IO::FileExists(mapPath)) {
+        try { bsha = MG_Sha256File(mapPath); } catch { }
+    }
+    if (bsha.Length == 0 || (bshaBefore.Length > 0 && bsha == bshaBefore)) {
+        g_mgRepoStatusText = "the game didn't finish saving the map — press Ctrl+S in the editor and try again";
+        g_ghStatus = g_mgRepoStatusText;
+        MG_Log("commit: aborted — map file on disk did not update after SaveMapSameName (" +
+               mapPath + ", FileName='" + string(map.MapInfo.FileName) + "')");
+        UI::ShowNotification("MapGit", "The game didn't finish saving the map file. Press Ctrl+S in the editor and try Share again.");
+        g_mgRepoBusy = false;
+        return;
+    }
+
+    // 2) manifest snapshot (after the save has settled on disk)
     MGManifest@ m = MG_BuildManifest(map);
     string tmpManifest = IO::FromStorageFolder("commit-manifest.json");
     MG_WriteManifest(m, tmpManifest);
     yield();
     string msha = MG_Sha256File(tmpManifest);
-
-    // 3) blob snapshot (the saved file) — absolute path via the map's fid
-    CSystemFidFile@ mapFid = map.MapInfo.Fid;
-    string mapPath;
-    if (mapFid !is null) {
-        mapPath = mapFid.FullFileName; // wstring -> string (absolute path)
-    } else {
-        mapPath = IO::FromUserGameFolder(mapFile);
-        MG_Log("commit: map fid missing, using " + mapPath);
-    }
-    yield();
-    string bsha = MG_Sha256File(mapPath);
     MG_Log("commit: manifest " + MG_Short(msha) + ", blob " + MG_Short(bsha));
 
-    // 4) branch/tip + dirty check (MediaTracker clips aren't in the manifest)
+    // 3) branch/tip + dirty check (MediaTracker clips aren't in the manifest)
     string branch = MG_CurrentBranch(repoDir);
     string tip = MG_TipSha(repoDir, branch);
     string mediaFp = MG_MediaFingerprint(map);
@@ -279,19 +320,21 @@ void MG_CommitCoro() {
             if (tm == msha && tb == bsha) {
                 g_mgRepoStatusText = "nothing to commit (identical to HEAD " + MG_Short(tip) + ")";
                 MG_Log("commit: nothing to commit");
+                g_mgLastCommitOk = true;
                 g_mgRepoBusy = false;
                 return;
             }
             if (tm == msha) {
                 g_mgRepoStatusText = "nothing to commit (volatile-only save; manifest unchanged)";
                 MG_Log("commit: volatile-only save skipped");
+                g_mgLastCommitOk = true;
                 g_mgRepoBusy = false;
                 return;
             }
         }
     }
 
-    // 5) store objects
+    // 4) store objects
     MG_CopyFile(tmpManifest, repoDir + "/objects/manifests/" + msha + ".json");
     yield();
     MG_CopyFile(mapPath, repoDir + "/objects/blobs/" + bsha + ".gbx");
@@ -325,6 +368,7 @@ void MG_CommitCoro() {
     MG_LoadLog(repoDir, csha);
     MG_LoadTimeline(repoDir, csha); // panel timeline
     MG_Log("commit: " + csha + "  \"" + msg + "\"");
+    g_mgLastCommitOk = true;
     g_mgRepoBusy = false;
 }
 
@@ -422,13 +466,7 @@ void MG_CheckoutCoro() {
     }
     string blobPath = repoDir + "/objects/blobs/" + tBlob + ".gbx";
     if (!IO::FileExists(blobPath)) { MG_Log("checkout: blob missing: " + blobPath); g_mgRepoBusy = false; return; }
-    CSystemFidFile@ mapFid = map.MapInfo.Fid;
-    string mapPath;
-    if (mapFid !is null) {
-        mapPath = mapFid.FullFileName;
-    } else {
-        mapPath = IO::FromUserGameFolder(mapFile);
-    }
+    string mapPath = MG_MapAbsPath(map);
     try {
         MG_CopyFile(blobPath, mapPath);
     } catch {

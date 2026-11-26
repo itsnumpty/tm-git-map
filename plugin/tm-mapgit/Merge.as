@@ -1847,10 +1847,7 @@ bool MG_RestoreOursBlob(CGameCtnChallenge@ map, const string&in repoDir, const s
     if (!MG_ReadCommit(repoDir, oursTip, parents, manifest, blob, author, message, time)) return false;
     string blobPath = repoDir + "/objects/blobs/" + blob + ".gbx";
     if (!IO::FileExists(blobPath)) return false;
-    CSystemFidFile@ mapFid = map.MapInfo.Fid;
-    string mapPath;
-    if (mapFid !is null) { mapPath = mapFid.FullFileName; }
-    else { mapPath = IO::FromUserGameFolder(MG_MapFileOf(map)); }
+    string mapPath = MG_MapAbsPath(map);
     try {
         MG_CopyFile(blobPath, mapPath);
     } catch {
@@ -1935,10 +1932,7 @@ void MG_MergeFromTips(const string&in repoDir, const string&in oursTip, const st
         g_mgRepoTip = theirsTip;
         string p, m, b, a, msg; int64 t;
         if (MG_ReadCommit(repoDir, theirsTip, p, m, b, a, msg, t)) {
-            CSystemFidFile@ mapFid = map.MapInfo.Fid;
-            string mapPath;
-            if (mapFid !is null) { mapPath = mapFid.FullFileName; }
-            else { mapPath = IO::FromUserGameFolder(MG_MapFileOf(map)); }
+            string mapPath = MG_MapAbsPath(map);
             MG_InstallCustomFilesFor(repoDir, theirsTip); // loaded when the map reopens
             try { MG_CopyFile(repoDir + "/objects/blobs/" + b + ".gbx", mapPath); } catch { }
             if (Permissions::OpenAdvancedMapEditor()) {

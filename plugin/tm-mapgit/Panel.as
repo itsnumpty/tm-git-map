@@ -196,10 +196,7 @@ void MG_RestoreWork() {
 
     string blobPath = repoDir + "/objects/blobs/" + rBlob + ".gbx";
     if (!IO::FileExists(blobPath)) { MG_Log("restore: snapshot data missing"); g_mgRepoBusy = false; return; }
-    CSystemFidFile@ mapFid = map.MapInfo.Fid;
-    string mapPath;
-    if (mapFid !is null) { mapPath = mapFid.FullFileName; }
-    else { mapPath = IO::FromUserGameFolder(mapFile); }
+    string mapPath = MG_MapAbsPath(map);
     try {
         MG_CopyFile(blobPath, mapPath);
     } catch {
@@ -569,6 +566,7 @@ void MG_ShareWork() {
             g_mgCommitMsg = g_mgShareNote.Length > 0 ? g_mgShareNote : "first version";
             g_mgShareNote = "";
             MG_CommitCoro();
+            if (!g_mgLastCommitOk) { g_mgRepoBusy = false; return; }
         } else {
             // unsaved work? save it as a version first (the share includes it)
             MG_Log("share: checking for unsaved changes...");
@@ -587,6 +585,7 @@ void MG_ShareWork() {
                 g_mgShareNote = "";
                 MG_Log("share: saving your unsaved work as a version...");
                 MG_CommitCoro();
+                if (!g_mgLastCommitOk) { g_mgRepoBusy = false; return; }
             } else {
                 MG_Log("share: nothing new to save locally");
                 g_mgCommitMsg = g_mgShareNote;

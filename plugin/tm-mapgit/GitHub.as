@@ -893,53 +893,75 @@ void GH_PullWork() {
 
     // Fast-forward when the local tip is still at the last synced commit.
     if (localTip == lastLocal || localTip.Length == 0) {
+        string newParents, newMan, newBlob, newAuthor, newMsg;
+        int64 newTime;
+        if (!MG_ReadCommit(repoDir, prevLocal, newParents, newMan, newBlob, newAuthor, newMsg, newTime)) {
+            MG_Log("pull: imported commit unreadable (" + MG_Short(prevLocal) + ")");
+            g_ghStatus = "imported commit unreadable";
+            g_ghBusy = false;
+            return;
+        }
+
+        // Check whether the open map has unsaved edits relative to the CURRENT tip
+        // (localTip) BEFORE advancing refs or sync state.
+        bool dirty = false;
+        if (localTip.Length > 0) {
+            MG_Log("pull: checking the working map before updating...");
+            MGManifest@ m = MG_BuildManifest(map);
+            string tmp = IO::FromStorageFolder("pull-manifest.json");
+            MG_WriteManifest(m, tmp);
+            yield();
+            string msha = MG_Sha256File(tmp);
+            string oldParents, oldMan, oldBlob, oldAuthor, oldMsg;
+            int64 oldTime;
+            if (MG_ReadCommit(repoDir, localTip, oldParents, oldMan, oldBlob, oldAuthor, oldMsg, oldTime)) {
+                if (oldMan != msha || MG_MediaChangedSince(map, repoDir, localTip, false)) {
+                    dirty = true;
+                }
+            }
+        }
+
+        if (dirty) {
+            g_ghStatus = "you have unsaved edits — Share or undo them first, then Update again";
+            MG_Log("pull: working map has unsaved edits relative to " + MG_Short(localTip) + " — leaving refs un-advanced");
+            UI::ShowNotification("MapGit", "You have unsaved edits on this map. Share or undo them first, then Update again.");
+            g_ghBusy = false;
+            return;
+        }
+
+        string mapPath = MG_MapAbsPath(map);
+        MG_InstallCustomFilesFor(repoDir, prevLocal); // loaded when the map reopens
+        try {
+            MG_CopyFile(repoDir + "/objects/blobs/" + newBlob + ".gbx", mapPath);
+        } catch {
+            MG_Log("pull: failed to write the map file: " + getExceptionInfo());
+            g_ghStatus = "imported, map file write failed";
+            g_ghBusy = false;
+            return;
+        }
+
+        // Advance branch + sync state only after the new map file is safely on disk.
         MG_WriteTextFile(repoDir + "/refs/heads/" + branch, prevLocal);
         g_mgRepoTip = prevLocal;
-        MG_Log("pull: fast-forwarded '" + branch + "' to " + MG_Short(prevLocal));
-
-        MG_Log("pull: checking the working map before restoring...");
-        MGManifest@ m = MG_BuildManifest(map);
-        string tmp = IO::FromStorageFolder("pull-manifest.json");
-        MG_WriteManifest(m, tmp);
-        yield();
-        string msha = MG_Sha256File(tmp);
-        string parents, tm, tb, author, message;
-        int64 time;
-        if (MG_ReadCommit(repoDir, prevLocal, parents, tm, tb, author, message, time) && tm != msha) {
-            g_ghStatus = "imported " + imported + " commits; working map dirty — commit or undo, then reopen";
-            MG_Log("pull: " + g_ghStatus);
-        } else {
-            CSystemFidFile@ mapFid = map.MapInfo.Fid;
-            string mapPath;
-            if (mapFid !is null) { mapPath = mapFid.FullFileName; }
-            else { mapPath = IO::FromUserGameFolder(MG_MapFileOf(map)); }
-            MG_InstallCustomFilesFor(repoDir, prevLocal); // loaded when the map reopens
-            try {
-                MG_CopyFile(repoDir + "/objects/blobs/" + tb + ".gbx", mapPath);
-            } catch {
-                MG_Log("pull: failed to write the map file: " + getExceptionInfo());
-                g_ghStatus = "imported, map file write failed";
-                g_ghBusy = false;
-                return;
-            }
-            if (Permissions::OpenAdvancedMapEditor()) {
-                string mapFile = MG_MapFileOf(map);
-                auto app = cast<CGameManiaPlanet>(GetApp());
-                app.BackToMainMenu();
-                while (!app.ManiaTitleControlScriptAPI.IsReady) yield();
-                while (app.Switcher.ModuleStack.Length < 1 || cast<CTrackManiaMenus>(app.Switcher.ModuleStack[0]) is null) yield();
-                yield();
-                app.ManiaTitleControlScriptAPI.EditMap(mapFile, "", "");
-                uint waited = 0;
-                while (GetMap() is null && waited < 3000) { yield(); waited++; }
-                MG_Log("pull: reopened the map at " + MG_Short(prevLocal));
-            }
-            g_ghStatus = "pulled " + imported + " commits (" + branch + ")";
-        }
-        // Sync markers advance only after a successful FF absorb.
         GH_WriteRemoteState(repoDir, branch, prevLocal, remoteGit);
         g_mgRemoteSentence = "";
         g_mgNotifiedRemoteGit = "";
+        g_mgAutoRepoKey = ""; // re-check status cleanly after reopen
+        MG_Log("pull: fast-forwarded '" + branch + "' to " + MG_Short(prevLocal));
+
+        if (Permissions::OpenAdvancedMapEditor()) {
+            string mapFile = MG_MapFileOf(map);
+            auto app = cast<CGameManiaPlanet>(GetApp());
+            app.BackToMainMenu();
+            while (!app.ManiaTitleControlScriptAPI.IsReady) yield();
+            while (app.Switcher.ModuleStack.Length < 1 || cast<CTrackManiaMenus>(app.Switcher.ModuleStack[0]) is null) yield();
+            yield();
+            app.ManiaTitleControlScriptAPI.EditMap(mapFile, "", "");
+            uint waited = 0;
+            while (GetMap() is null && waited < 3000) { yield(); waited++; }
+            MG_Log("pull: reopened the map at " + MG_Short(prevLocal));
+        }
+        g_ghStatus = "pulled " + imported + " commits (" + branch + ")";
         MG_Log("pull: done — " + g_ghStatus);
         g_ghBusy = false;
         return;
